@@ -3,7 +3,8 @@
 #include <cutlass/numeric_types.h>
 using half_t = cutlass::half_t;
 
-struct Qkv_params {
+struct Qkv_params
+{
     using index_t = int64_t;
     // The QKV matrices.
     half_t *__restrict__ q_ptr;
@@ -34,26 +35,26 @@ struct Qkv_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Flash_fwd_params : public Qkv_params {
+struct Flash_fwd_params : public Qkv_params
+{
 
     // The O matrix (output).
-    half_t * __restrict__ o_ptr;
-
+    half_t *__restrict__ o_ptr;
 
     index_t o_batch_stride;
     index_t o_row_stride;
     index_t o_head_stride;
 
-
     // The pointer to the softmax sum.
-    float * __restrict__ l_ptr;
+    float *__restrict__ l_ptr;
+    int *__restrict__ seqused_k;
     float softmax_scale;
     int b, seqlen_q, seqlen_k, d;
     bool is_causal;
 };
 
-
-struct Flash_bwd_params : public Flash_fwd_params {
+struct Flash_bwd_params : public Flash_fwd_params
+{
 
     half_t *__restrict__ do_ptr;
     half_t *__restrict__ dq_ptr;
@@ -73,11 +74,10 @@ struct Flash_bwd_params : public Flash_fwd_params {
     // index_t dq_head_stride;
     // index_t dk_head_stride;
     // index_t dv_head_stride;
-
 };
 
+template <int Headdim, bool Is_causal>
+void run_mha_fwd_(Flash_fwd_params &params);
 
-template<int Headdim, bool Is_causal> void run_mha_fwd_(Flash_fwd_params &params);
-
-
-template<int Headdim, bool Is_causal> void run_mha_bwd_(Flash_bwd_params &params);
+template <int Headdim, bool Is_causal>
+void run_mha_bwd_(Flash_bwd_params &params);

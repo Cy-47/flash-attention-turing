@@ -1,6 +1,9 @@
 #include <torch/extension.h>
+#include <pybind11/pytypes.h>
 #include "flash.h"
 #include "static_switch.h"
+
+namespace py = pybind11;
 
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
@@ -16,25 +19,25 @@ void set_params_fprop(Flash_fwd_params &params,
                       const at::Tensor v,
                       at::Tensor out,
                       at::Tensor l,
-                      //void *softmax_lse_d,
+                      // void *softmax_lse_d,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
+                      void *seqused_k_d,
                       float softmax_scale,
-                      bool is_causal) {
+                      bool is_causal)
+{
 
     // Reset the parameters
     params = {};
 
     // Set the pointers and strides.
-    params.q_ptr = reinterpret_cast<half_t*>(q.data_ptr());
-    params.k_ptr = reinterpret_cast<half_t*>(k.data_ptr());
-    params.v_ptr = reinterpret_cast<half_t*>(v.data_ptr());
-    params.o_ptr = reinterpret_cast<half_t*>(out.data_ptr());
-
+    params.q_ptr = reinterpret_cast<half_t *>(q.data_ptr());
+    params.k_ptr = reinterpret_cast<half_t *>(k.data_ptr());
+    params.v_ptr = reinterpret_cast<half_t *>(v.data_ptr());
+    params.o_ptr = reinterpret_cast<half_t *>(out.data_ptr());
 
     // Softmax sum
-    params.l_ptr = reinterpret_cast<float*>(l.data_ptr());
-
+    params.l_ptr = reinterpret_cast<float *>(l.data_ptr());
 
     // All stride are in elements, not bytes.
     // params.q_row_stride = q.stride(-3);
@@ -54,8 +57,6 @@ void set_params_fprop(Flash_fwd_params &params,
     //     params.o_batch_stride = out.stride(0);
     // }
 
-
-
     // Set the dimensions.
     params.b = b;
     params.seqlen_q = seqlen_q;
@@ -68,8 +69,8 @@ void set_params_fprop(Flash_fwd_params &params,
     params.is_causal = is_causal;
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+    params.seqused_k = static_cast<int *>(seqused_k_d);
 }
-
 
 void set_params_dgrad(Flash_bwd_params &params,
                       // sizes
@@ -92,10 +93,11 @@ void set_params_dgrad(Flash_bwd_params &params,
                       at::Tensor do_o,
                       void *cu_seqlens_q_d,
                       void *cu_seqlens_k_d,
-                      //void *softmax_lse_d,
+                      void *seqused_k_d,
+                      // void *softmax_lse_d,
                       float softmax_scale,
-                      bool is_causal) {
-
+                      bool is_causal)
+{
 
     set_params_fprop(params,
                      b,
@@ -107,17 +109,16 @@ void set_params_dgrad(Flash_bwd_params &params,
                      q, k, v, out, l,
                      cu_seqlens_q_d,
                      cu_seqlens_k_d,
+                     seqused_k_d,
                      softmax_scale,
-                     is_causal
-                     );
+                     is_causal);
 
+    params.do_o_ptr = reinterpret_cast<float *>(do_o.data_ptr());
+    params.do_ptr = reinterpret_cast<half_t *>(dout.data_ptr());
 
-    params.do_o_ptr = reinterpret_cast<float*>(do_o.data_ptr());
-    params.do_ptr = reinterpret_cast<half_t*>(dout.data_ptr());
-
-    params.dq_ptr = reinterpret_cast<half_t*>(dq.data_ptr());
-    params.dk_ptr = reinterpret_cast<half_t*>(dk.data_ptr());
-    params.dv_ptr = reinterpret_cast<half_t*>(dv.data_ptr());
+    params.dq_ptr = reinterpret_cast<half_t *>(dq.data_ptr());
+    params.dk_ptr = reinterpret_cast<half_t *>(dk.data_ptr());
+    params.dv_ptr = reinterpret_cast<half_t *>(dv.data_ptr());
 
     // params.do_row_stride = dout.stride(-3);
     // params.do_head_stride = dout.stride(-2);
@@ -127,7 +128,7 @@ void set_params_dgrad(Flash_bwd_params &params,
     // params.dv_row_stride = dv.stride(-3);
     // params.dq_head_stride = dq.stride(-2);
     // params.dk_head_stride = dk.stride(-2);
-    // params.dv_head_stride = dv.stride(-2);                
+    // params.dv_head_stride = dv.stride(-2);
 
     // if (cu_seqlens_q_d == nullptr) {
     //     params.do_batch_stride = dout.stride(0);
@@ -135,36 +136,30 @@ void set_params_dgrad(Flash_bwd_params &params,
     //     params.dk_batch_stride = dk.stride(0);
     //     params.dv_batch_stride = dv.stride(0);
     // }
-
-
 }
 
-
-void run_mha_fwd(Flash_fwd_params &params){
-    HEADDIM_SWITCH(params.d, [&] {
-        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-                run_mha_fwd_<kHeadDim, Is_causal>(params);
-        });
-    });
+void run_mha_fwd(Flash_fwd_params &params)
+{
+    HEADDIM_SWITCH(params.d, [&]
+                   { BOOL_SWITCH(params.is_causal, Is_causal, [&]
+                                 { run_mha_fwd_<kHeadDim, Is_causal>(params); }); });
 }
 
-void run_mha_bwd(Flash_bwd_params &params){
-    HEADDIM_SWITCH(params.d, [&] {
-        BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-                run_mha_bwd_<kHeadDim, Is_causal>(params);
-        });
-    });
+void run_mha_bwd(Flash_bwd_params &params)
+{
+    HEADDIM_SWITCH(params.d, [&]
+                   { BOOL_SWITCH(params.is_causal, Is_causal, [&]
+                                 { run_mha_bwd_<kHeadDim, Is_causal>(params); }); });
 }
-
 
 std::vector<at::Tensor>
 mha_fwd(at::Tensor q,
         at::Tensor k,
         at::Tensor v,
-//             int batch_size,
-//             int seq_len,
-//             int num_heads,
-//             int head_dim,
+        //             int batch_size,
+        //             int seq_len,
+        //             int num_heads,
+        //             int head_dim,
         const float softmax_scale,
         bool is_causal)
 {
@@ -194,12 +189,12 @@ mha_fwd(at::Tensor q,
 
     TORCH_CHECK(o.is_cuda(), "Tensor o is not on CUDA");
 
-//    half_t* q_ptr = reinterpret_cast<half_t*>(q.data_ptr());
-//    half_t* k_ptr = reinterpret_cast<half_t*>(k.data_ptr());
-//    half_t* v_ptr = reinterpret_cast<half_t*>(v.data_ptr());
-//    half_t* o_ptr = reinterpret_cast<half_t*>(o.data_ptr());
-//
-//    float* l_ptr = reinterpret_cast<float*>(l.data_ptr());
+    //    half_t* q_ptr = reinterpret_cast<half_t*>(q.data_ptr());
+    //    half_t* k_ptr = reinterpret_cast<half_t*>(k.data_ptr());
+    //    half_t* v_ptr = reinterpret_cast<half_t*>(v.data_ptr());
+    //    half_t* o_ptr = reinterpret_cast<half_t*>(o.data_ptr());
+    //
+    //    float* l_ptr = reinterpret_cast<float*>(l.data_ptr());
 
     Flash_fwd_params params;
     set_params_fprop(params,
@@ -212,9 +207,9 @@ mha_fwd(at::Tensor q,
                      q, k, v, o, l,
                      nullptr,
                      nullptr,
+                     nullptr,
                      softmax_scale,
-                     is_causal
-                     );
+                     is_causal);
 
     // std::cout << "Q ptr: " << q.data_ptr() << "\n";
     // std::cout << "K ptr: " << k.data_ptr() << "\n";
@@ -223,13 +218,8 @@ mha_fwd(at::Tensor q,
 
     run_mha_fwd(params);
 
-
     return {o, l};
-
 }
-
-
-
 
 std::vector<at::Tensor>
 mha_bwd(at::Tensor q,
@@ -238,10 +228,10 @@ mha_bwd(at::Tensor q,
         at::Tensor out,
         at::Tensor l,
         at::Tensor dout,
-//        int batch_size,
-//        int seq_len,
-//        int num_heads,
-//        int head_dim,
+        //        int batch_size,
+        //        int seq_len,
+        //        int num_heads,
+        //        int head_dim,
         const float softmax_scale,
         bool is_causal)
 {
@@ -270,10 +260,13 @@ mha_bwd(at::Tensor q,
     at::Tensor dv = torch::zeros(v.sizes(), v.options().dtype(torch::kFloat16));
 
     at::Tensor dk_expanded, dv_expanded;
-    if (num_heads != num_heads_k) {
+    if (num_heads != num_heads_k)
+    {
         dk_expanded = torch::zeros({batch_size, seqlen_k, num_heads, head_size}, k.options().dtype(torch::kFloat16));
         dv_expanded = torch::zeros({batch_size, seqlen_k, num_heads, head_size}, v.options().dtype(torch::kFloat16));
-    } else {
+    }
+    else
+    {
         dk_expanded = dk;
         dv_expanded = dv;
     }
@@ -284,44 +277,42 @@ mha_bwd(at::Tensor q,
 
     set_params_dgrad(params,
                      batch_size,
-                    seqlen_q,
-                    seqlen_k,
-                    num_heads,
-                    num_heads_k,
-                    head_size,
-                    q,
-                    k,
-                    v,
-                    out,
-                    l,
-                    dout,
-                    dq,
-                    dk_expanded,
-                    dv_expanded,
-                    do_o,
-                    nullptr,
-                    nullptr,
-                    softmax_scale,
-                    is_causal);
+                     seqlen_q,
+                     seqlen_k,
+                     num_heads,
+                     num_heads_k,
+                     head_size,
+                     q,
+                     k,
+                     v,
+                     out,
+                     l,
+                     dout,
+                     dq,
+                     dk_expanded,
+                     dv_expanded,
+                     do_o,
+                     nullptr,
+                     nullptr,
+                     nullptr,
+                     softmax_scale,
+                     is_causal);
 
     run_mha_bwd(params);
 
-    if (num_heads != num_heads_k) {
+    if (num_heads != num_heads_k)
+    {
         torch::sum_out(
             dk,
             torch::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}),
-            {3}
-        );
+            {3});
         torch::sum_out(
             dv,
             torch::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}),
-            {3}
-        );
+            {3});
     }
 
-
     return {dq, dk, dv};
-
 }
 
 std::vector<at::Tensor>
@@ -360,14 +351,12 @@ mha_varlen_fwd(at::Tensor q,
     at::Tensor out = torch::zeros_like(q);
     at::Tensor l = torch::zeros({batch_size, num_heads, max_seqlen_q}, q.options().dtype(torch::kFloat32));
 
-
     // at::Tensor o = torch::zeros(q.sizes(), q.options().dtype(torch::kFloat16));
 
     // std::vector<int64_t> size = {batch_size, num_heads, seqlen_q};
     // at::Tensor l = torch::zeros(size, q.options().dtype(torch::kFloat32).device(device));
 
     // TORCH_CHECK(o.is_cuda(), "Tensor o is not on CUDA");
-
 
     Flash_fwd_params params;
     set_params_fprop(
@@ -381,9 +370,9 @@ mha_varlen_fwd(at::Tensor q,
         q, k, v, out, l,
         cu_seqlens_q.data_ptr(),
         cu_seqlens_k.data_ptr(),
+        nullptr,
         softmax_scale,
-        is_causal
-    );
+        is_causal);
 
     run_mha_fwd(params);
 
@@ -438,7 +427,8 @@ mha_varlen_bwd(at::Tensor q,
     at::Tensor dv = torch::zeros_like(v);
     at::Tensor dk_expanded = dk;
     at::Tensor dv_expanded = dv;
-    if (num_heads != num_heads_k) {
+    if (num_heads != num_heads_k)
+    {
         dk_expanded = torch::zeros({total_k, num_heads, head_size}, k.options().dtype(torch::kFloat16));
         dv_expanded = torch::zeros({total_k, num_heads, head_size}, v.options().dtype(torch::kFloat16));
     }
@@ -457,32 +447,171 @@ mha_varlen_bwd(at::Tensor q,
         dq, dk_expanded, dv_expanded, do_o,
         cu_seqlens_q.data_ptr(),
         cu_seqlens_k.data_ptr(),
+        nullptr,
         softmax_scale,
-        is_causal
-    );
+        is_causal);
 
     run_mha_bwd(params);
 
-    if (num_heads != num_heads_k) {
+    if (num_heads != num_heads_k)
+    {
         torch::sum_out(
             dk,
             torch::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}),
-            {2}
-        );
+            {2});
         torch::sum_out(
             dv,
             torch::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}),
-            {2}
-        );
+            {2});
     }
 
     return {dq, dk, dv};
 }
 
+std::vector<at::Tensor>
+mha_fwd_kvcache(at::Tensor q,
+                at::Tensor k_cache,
+                at::Tensor v_cache,
+                py::object k_obj,
+                py::object v_obj,
+                at::Tensor cache_seqlens,
+                py::object cache_batch_idx_obj,
+                const float softmax_scale,
+                bool is_causal)
+{
+    TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(), "q, k_cache, v_cache must be CUDA tensors");
+    TORCH_CHECK(q.scalar_type() == torch::kFloat16 && k_cache.scalar_type() == torch::kFloat16 && v_cache.scalar_type() == torch::kFloat16,
+                "q, k_cache, v_cache must be float16 tensors");
+    TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4,
+                "q, k_cache, v_cache must be rank-4 tensors");
+    TORCH_CHECK(k_cache.size(1) == v_cache.size(1), "k_cache and v_cache seqlen must match");
+    TORCH_CHECK(k_cache.size(2) == v_cache.size(2), "k_cache and v_cache num_heads must match");
+    TORCH_CHECK(q.size(3) == k_cache.size(3) && q.size(3) == v_cache.size(3),
+                "q, k_cache, v_cache head_dim must match");
+    TORCH_CHECK(q.size(2) % k_cache.size(2) == 0,
+                "num_heads_q must be divisible by num_heads_k for GQA/MQA");
+    TORCH_CHECK(q.stride(-1) == 1 && k_cache.stride(-1) == 1 && v_cache.stride(-1) == 1,
+                "q, k_cache, v_cache must have contiguous last dimension");
+    TORCH_CHECK(cache_seqlens.is_cuda(), "cache_seqlens must be a CUDA tensor");
+    TORCH_CHECK(cache_seqlens.scalar_type() == torch::kInt32, "cache_seqlens must be an int32 tensor");
+    TORCH_CHECK(cache_seqlens.is_contiguous(), "cache_seqlens must be contiguous");
+    TORCH_CHECK(cache_seqlens.dim() == 1 && cache_seqlens.numel() == q.size(0),
+                "cache_seqlens must have shape [batch_size]");
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    const int batch_size = q.size(0);
+    const int seqlen_q = q.size(1);
+    const int num_heads = q.size(2);
+    const int seqlen_cache = k_cache.size(1);
+    const int num_heads_k = k_cache.size(2);
+    const int head_size = q.size(3);
+    const int batch_size_cache = k_cache.size(0);
+
+    at::Tensor cache_batch_idx;
+    const bool has_cache_batch_idx = !cache_batch_idx_obj.is_none();
+    if (has_cache_batch_idx)
+    {
+        cache_batch_idx = cache_batch_idx_obj.cast<at::Tensor>();
+        TORCH_CHECK(cache_batch_idx.is_cuda(), "cache_batch_idx must be a CUDA tensor");
+        TORCH_CHECK(cache_batch_idx.scalar_type() == torch::kInt32, "cache_batch_idx must be an int32 tensor");
+        TORCH_CHECK(cache_batch_idx.is_contiguous(), "cache_batch_idx must be contiguous");
+        TORCH_CHECK(cache_batch_idx.dim() == 1 && cache_batch_idx.numel() == batch_size,
+                    "cache_batch_idx must have shape [batch_size]");
+    }
+    else
+    {
+        TORCH_CHECK(batch_size == batch_size_cache,
+                    "q and cache batch size must match when cache_batch_idx is not provided");
+    }
+
+    at::Tensor k;
+    at::Tensor v;
+    const bool has_k = !k_obj.is_none();
+    const bool has_v = !v_obj.is_none();
+    TORCH_CHECK(has_k == has_v, "k and v must either both be provided or both be None");
+    int seqlen_new = 0;
+    if (has_k)
+    {
+        k = k_obj.cast<at::Tensor>();
+        v = v_obj.cast<at::Tensor>();
+        TORCH_CHECK(k.is_cuda() && v.is_cuda(), "k and v must be CUDA tensors");
+        TORCH_CHECK(k.scalar_type() == torch::kFloat16 && v.scalar_type() == torch::kFloat16,
+                    "k and v must be float16 tensors");
+        TORCH_CHECK(k.dim() == 4 && v.dim() == 4, "k and v must be rank-4 tensors");
+        TORCH_CHECK(k.size(0) == batch_size && v.size(0) == batch_size, "k/v batch size must match q");
+        TORCH_CHECK(k.size(1) == v.size(1), "k and v seqlen must match");
+        TORCH_CHECK(k.size(2) == num_heads_k && v.size(2) == num_heads_k,
+                    "k/v num_heads must match the cache num_heads");
+        TORCH_CHECK(k.size(3) == head_size && v.size(3) == head_size, "k/v head_dim must match q");
+        TORCH_CHECK(k.stride(-1) == 1 && v.stride(-1) == 1, "k and v must have contiguous last dimension");
+        seqlen_new = k.size(1);
+    }
+
+    at::Tensor cache_seqlens_end = has_k ? cache_seqlens + seqlen_new : cache_seqlens;
+    TORCH_CHECK(cache_seqlens_end.max().item<int>() <= seqlen_cache,
+                "cache capacity is insufficient for the requested append length");
+
+    at::Tensor cache_batch_idx_cpu;
+    int *cache_batch_ptr = nullptr;
+    if (has_cache_batch_idx)
+    {
+        cache_batch_idx_cpu = cache_batch_idx.to(torch::TensorOptions().device(torch::kCPU));
+        cache_batch_ptr = cache_batch_idx_cpu.data_ptr<int>();
+        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx)
+        {
+            TORCH_CHECK(cache_batch_ptr[batch_idx] >= 0 && cache_batch_ptr[batch_idx] < batch_size_cache,
+                        "cache_batch_idx entries must be within cache batch bounds");
+        }
+    }
+
+    if (has_k)
+    {
+        at::Tensor cache_seqlens_cpu = cache_seqlens.to(torch::TensorOptions().device(torch::kCPU));
+        auto cache_ptr = cache_seqlens_cpu.data_ptr<int>();
+        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx)
+        {
+            const int start = cache_ptr[batch_idx];
+            const int cache_row = has_cache_batch_idx ? cache_batch_ptr[batch_idx] : batch_idx;
+            k_cache[cache_row].narrow(0, start, seqlen_new).copy_(k[batch_idx]);
+            v_cache[cache_row].narrow(0, start, seqlen_new).copy_(v[batch_idx]);
+        }
+    }
+
+    at::Tensor k_cache_used = has_cache_batch_idx
+                                  ? k_cache.index_select(0, cache_batch_idx.to(torch::kLong))
+                                  : k_cache;
+    at::Tensor v_cache_used = has_cache_batch_idx
+                                  ? v_cache.index_select(0, cache_batch_idx.to(torch::kLong))
+                                  : v_cache;
+
+    at::Tensor out = torch::zeros_like(q);
+    at::Tensor l = torch::zeros({batch_size, num_heads, seqlen_q}, q.options().dtype(torch::kFloat32));
+
+    Flash_fwd_params params;
+    set_params_fprop(
+        params,
+        batch_size,
+        seqlen_q,
+        seqlen_cache,
+        num_heads,
+        num_heads_k,
+        head_size,
+        q, k_cache_used, v_cache_used, out, l,
+        nullptr,
+        nullptr,
+        cache_seqlens_end.data_ptr(),
+        softmax_scale,
+        is_causal);
+
+    run_mha_fwd(params);
+
+    return {out, l};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+{
     m.def("fwd", &mha_fwd, "Forward pass");
     m.def("bwd", &mha_bwd, "Backward pass");
     m.def("varlen_fwd", &mha_varlen_fwd, "Varlen forward pass");
     m.def("varlen_bwd", &mha_varlen_bwd, "Varlen backward pass");
+    m.def("fwd_kvcache", &mha_fwd_kvcache, "KV-cache forward pass");
 }

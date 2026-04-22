@@ -17,6 +17,7 @@ from flash_attention_interface import (
     flash_attn_func,
     flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
+    flash_attn_with_kvcache,
     flash_attn_varlen_func,
     flash_attn_varlen_kvpacked_func,
     flash_attn_varlen_qkvpacked_func,
@@ -498,6 +499,40 @@ def _varlen_reference(
     )
 
 
+def _kvcache_reference(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_seqlens: Sequence[int],
+    *,
+    k_new: Optional[torch.Tensor] = None,
+    v_new: Optional[torch.Tensor] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    causal: bool,
+    softmax_scale: Optional[float],
+) -> torch.Tensor:
+    if cache_batch_idx is not None:
+        k_cache = k_cache[cache_batch_idx.to(dtype=torch.long)]
+        v_cache = v_cache[cache_batch_idx.to(dtype=torch.long)]
+    effective_lengths = list(cache_seqlens)
+    if k_new is not None and v_new is not None:
+        for batch_idx, start in enumerate(cache_seqlens):
+            k_cache[batch_idx, start : start + k_new.shape[1]] = k_new[batch_idx]
+            v_cache[batch_idx, start : start + v_new.shape[1]] = v_new[batch_idx]
+            effective_lengths[batch_idx] = start + k_new.shape[1]
+    outputs: List[torch.Tensor] = []
+    for batch_idx, seqlen_k in enumerate(effective_lengths):
+        out_i = vanilla_attention_ref(
+            q[batch_idx : batch_idx + 1],
+            k_cache[batch_idx : batch_idx + 1, :seqlen_k],
+            v_cache[batch_idx : batch_idx + 1, :seqlen_k],
+            causal=causal,
+            softmax_scale=softmax_scale,
+        )[0]
+        outputs.append(out_i)
+    return torch.cat(outputs, dim=0)
+
+
 def _bundle_from_tensors(
     output: torch.Tensor,
     dq: torch.Tensor,
@@ -926,6 +961,248 @@ def test_flash_attn_varlen_kv(
         pairs=pairs,
     )
     _assert_metrics(bundle)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("nheads, nheads_k", [(4, 2), (6, 1)])
+@pytest.mark.parametrize("causal", CAUSAL_FLAGS)
+@pytest.mark.parametrize("softmax_scale", SOFTMAX_SCALES)
+@pytest.mark.parametrize("has_batch_idx", [False, True])
+def test_flash_attn_kvcache_read(
+    nheads: int,
+    nheads_k: int,
+    head_dim: int,
+    softmax_scale: Optional[float],
+    causal: bool,
+    has_batch_idx: bool,
+    dtype: torch.dtype,
+) -> None:
+    device = _cuda_device()
+    batch_size = 2
+    batch_size_cache = 4 if has_batch_idx else batch_size
+    seqlen_q = 4
+    seqlen_cache = 17
+    cache_lengths = [7, 13]
+
+    q = torch.randn(batch_size, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size_cache, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    v_cache = torch.randn(batch_size_cache, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    cache_seqlens = torch.tensor(cache_lengths, device=device, dtype=torch.int32)
+    cache_batch_idx = (
+        torch.tensor([2, 0], device=device, dtype=torch.int32) if has_batch_idx else None
+    )
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=cache_batch_idx,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    )
+    torch.cuda.synchronize()
+
+    out_ref = _kvcache_reference(
+        q,
+        k_cache.clone(),
+        v_cache.clone(),
+        cache_lengths,
+        cache_batch_idx=cache_batch_idx,
+        causal=causal,
+        softmax_scale=softmax_scale,
+    )
+
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("nheads, nheads_k", [(4, 2), (6, 1)])
+@pytest.mark.parametrize("causal", CAUSAL_FLAGS)
+@pytest.mark.parametrize("softmax_scale", SOFTMAX_SCALES)
+@pytest.mark.parametrize("has_batch_idx", [False, True])
+@pytest.mark.parametrize("append_len", [1, 3])
+def test_flash_attn_kvcache_append(
+    nheads: int,
+    nheads_k: int,
+    head_dim: int,
+    softmax_scale: Optional[float],
+    causal: bool,
+    has_batch_idx: bool,
+    append_len: int,
+    dtype: torch.dtype,
+) -> None:
+    device = _cuda_device()
+    batch_size = 2
+    seqlen_q = 4
+    batch_size_cache = 4 if has_batch_idx else batch_size
+    seqlen_cache = 20
+    cache_lengths = [5, 9]
+
+    q = torch.randn(batch_size, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size_cache, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    v_cache = torch.randn(batch_size_cache, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    k_new = torch.randn(batch_size, append_len, nheads_k, head_dim, device=device, dtype=dtype)
+    v_new = torch.randn(batch_size, append_len, nheads_k, head_dim, device=device, dtype=dtype)
+    cache_seqlens = torch.tensor(cache_lengths, device=device, dtype=torch.int32)
+    cache_batch_idx = (
+        torch.tensor([3, 1], device=device, dtype=torch.int32) if has_batch_idx else None
+    )
+
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+    updated_lengths = [length + append_len for length in cache_lengths]
+    for batch_idx, start in enumerate(cache_lengths):
+        cache_row = cache_batch_idx[batch_idx].item() if cache_batch_idx is not None else batch_idx
+        k_cache_ref[cache_row, start : start + append_len] = k_new[batch_idx]
+        v_cache_ref[cache_row, start : start + append_len] = v_new[batch_idx]
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=cache_batch_idx,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    )
+    torch.cuda.synchronize()
+
+    out_ref = _kvcache_reference(
+        q,
+        k_cache.clone(),
+        v_cache.clone(),
+        cache_lengths,
+        k_new=k_new,
+        v_new=v_new,
+        cache_batch_idx=cache_batch_idx,
+        causal=causal,
+        softmax_scale=softmax_scale,
+    )
+
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_cache, k_cache_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(v_cache, v_cache_ref, atol=1e-3, rtol=1e-3)
+
+
+def test_flash_attn_kvcache_requires_cache_seqlens() -> None:
+    q = torch.randn(1, 2, 4, 64)
+    k_cache = torch.randn(1, 8, 2, 64)
+    v_cache = torch.randn(1, 8, 2, 64)
+
+    with pytest.raises(ValueError, match="cache_seqlens is required"):
+        flash_attn_with_kvcache(q, k_cache, v_cache)
+
+
+def test_flash_attn_kvcache_requires_paired_kv() -> None:
+    q = torch.randn(1, 2, 4, 64)
+    k_cache = torch.randn(1, 8, 2, 64)
+    v_cache = torch.randn(1, 8, 2, 64)
+    k = torch.randn(1, 2, 2, 64)
+    cache_seqlens = torch.tensor([4], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="k and v must either both be provided"):
+        flash_attn_with_kvcache(q, k_cache, v_cache, k=k, cache_seqlens=cache_seqlens)
+
+
+def test_flash_attn_kvcache_requires_int32_cache_seqlens() -> None:
+    q = torch.randn(1, 2, 4, 64)
+    k_cache = torch.randn(1, 8, 2, 64)
+    v_cache = torch.randn(1, 8, 2, 64)
+    cache_seqlens = torch.tensor([4], dtype=torch.int64)
+
+    with pytest.raises(TypeError, match="cache_seqlens must be a torch.int32 tensor"):
+        flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens)
+
+
+def test_flash_attn_kvcache_rejects_cpu_tensors() -> None:
+    q = torch.randn(1, 2, 4, 64)
+    k_cache = torch.randn(1, 8, 2, 64)
+    v_cache = torch.randn(1, 8, 2, 64)
+    cache_seqlens = torch.tensor([4], dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="must be CUDA tensors"):
+        flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens)
+
+
+def test_flash_attn_kvcache_requires_batch_sized_cache_seqlens() -> None:
+    q = torch.randn(2, 2, 4, 64)
+    k_cache = torch.randn(2, 8, 2, 64)
+    v_cache = torch.randn(2, 8, 2, 64)
+    cache_seqlens = torch.tensor([4], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match=r"cache_seqlens must have shape \[batch_size\]"):
+        flash_attn_with_kvcache(q, k_cache, v_cache, cache_seqlens=cache_seqlens)
+
+
+def test_flash_attn_kvcache_accepts_shorter_append_length() -> None:
+    q = torch.randn(1, 2, 4, 64)
+    k_cache = torch.randn(1, 8, 2, 64, device="cuda", dtype=torch.float16)
+    v_cache = torch.randn(1, 8, 2, 64, device="cuda", dtype=torch.float16)
+    q_cuda = q.to(device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 1, 2, 64)
+    v = torch.randn(1, 1, 2, 64)
+    cache_seqlens = torch.tensor([4], dtype=torch.int32, device="cuda")
+
+    out = flash_attn_with_kvcache(
+        q_cuda,
+        k_cache,
+        v_cache,
+        k=k.to(device="cuda", dtype=torch.float16),
+        v=v.to(device="cuda", dtype=torch.float16),
+        cache_seqlens=cache_seqlens,
+    )
+    assert out.shape == q_cuda.shape
+
+
+def test_flash_attn_kvcache_requires_int32_cache_batch_idx() -> None:
+    q = torch.randn(1, 2, 4, 64)
+    k_cache = torch.randn(2, 8, 2, 64)
+    v_cache = torch.randn(2, 8, 2, 64)
+    cache_seqlens = torch.tensor([4], dtype=torch.int32)
+    cache_batch_idx = torch.tensor([1], dtype=torch.int64)
+
+    with pytest.raises(TypeError, match="cache_batch_idx must be a torch.int32 tensor"):
+        flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
+        )
+
+
+def test_flash_attn_kvcache_requires_batch_sized_cache_batch_idx() -> None:
+    q = torch.randn(2, 2, 4, 64)
+    k_cache = torch.randn(3, 8, 2, 64)
+    v_cache = torch.randn(3, 8, 2, 64)
+    cache_seqlens = torch.tensor([4, 5], dtype=torch.int32)
+    cache_batch_idx = torch.tensor([1], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match=r"cache_batch_idx must have shape \[batch_size\]"):
+        flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
+        )
+
+
+def test_flash_attn_kvcache_rejects_capacity_overrun() -> None:
+    q = torch.randn(1, 2, 4, 64)
+    k_cache = torch.randn(1, 5, 2, 64)
+    v_cache = torch.randn(1, 5, 2, 64)
+    k = torch.randn(1, 2, 2, 64)
+    v = torch.randn(1, 2, 2, 64)
+    cache_seqlens = torch.tensor([4], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="cache capacity is insufficient"):
+        flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

@@ -29,6 +29,7 @@ inline __device__ void compute_attn_1rowblock(
                           float* __restrict__ l,
                           const int* __restrict__ cu_seqlens_q,
                           const int* __restrict__ cu_seqlens_k,
+                          const int* __restrict__ seqused_k,
                           const int batch_size,
                           const int max_seqlen_q,
                           const int max_seqlen_k,
@@ -48,7 +49,7 @@ inline __device__ void compute_attn_1rowblock(
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
 
 
-    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(max_seqlen_q, max_seqlen_k, bidb, cu_seqlens_q, cu_seqlens_k);
+    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(max_seqlen_q, max_seqlen_k, bidb, cu_seqlens_q, cu_seqlens_k, seqused_k);
     const int seqlen_q = binfo.actual_seqlen_q;
     const int seqlen_k = binfo.actual_seqlen_k;
 
@@ -671,6 +672,7 @@ inline __device__ void compute_attn(half_t* __restrict__ q,
                                       float* __restrict__ l,
                                       int* __restrict__ cu_seqlens_q,
                                       int* __restrict__ cu_seqlens_k,
+                                      int* __restrict__ seqused_k,
                                       int batch_size,
                                       int seqlen_q,
                                       int seqlen_k,
@@ -693,6 +695,7 @@ inline __device__ void compute_attn(half_t* __restrict__ q,
                                                     l,
                                                     cu_seqlens_q,
                                                     cu_seqlens_k,
+                                                    seqused_k,
                                                     batch_size,
                                                     seqlen_q,
                                                     seqlen_k,

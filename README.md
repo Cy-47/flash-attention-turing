@@ -10,13 +10,16 @@ Supports:
  - head dim 64, 128
  - causal mask
  - gqa
+ - contiguous inference-only kv cache
  - varlen
 
 Does not support:
 
  - dropout
  - local mask
- - kv cache
+ - kv cache backward
+ - paged kv cache
+ - rotary / alibi / leftpad in kv cache mode
 
 ## Performance
 
@@ -52,6 +55,7 @@ The main functions implement scaled dot product attention: `softmax(Q @ K^T * so
 from flash_attention_interface import (
     flash_attn_func,
     flash_attn_kvpacked_func,
+    flash_attn_with_kvcache,
     flash_attn_qkvpacked_func,
     flash_attn_varlen_func,
     flash_attn_varlen_kvpacked_func,
@@ -61,6 +65,8 @@ from flash_attention_interface import (
 
 
 The arguments for these functions differ from the standard FlashAttention Python API because this implementation does not support every feature yet. See `turing/flash_attention_interface.py` for the full function signatures and parameter descriptions.
+
+`flash_attn_with_kvcache` currently supports contiguous cache tensors only and is intended for inference. If `k` and `v` are provided, they are appended into `k_cache` and `v_cache` in place starting at `cache_seqlens`, then attention runs against the updated cache. The API also supports `cache_batch_idx` to remap query rows onto cache rows. This path does not provide backward support and still keeps a smaller feature set than the full mainline FlashAttention KV-cache API.
 
 
 ## Requirements

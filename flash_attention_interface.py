@@ -110,6 +110,34 @@ def _flash_attn_varlen_backward(
     return dq, dk, dv
 
 
+def _flash_attn_kvcache_forward(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    cache_seqlens: torch.Tensor,
+    cache_batch_idx: Optional[torch.Tensor],
+    softmax_scale: float,
+    causal: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q, k_cache, v_cache, k, v, cache_seqlens, cache_batch_idx = [
+        maybe_contiguous(x) for x in (q, k_cache, v_cache, k, v, cache_seqlens, cache_batch_idx)
+    ]
+    out, lse = flash_attn_gpu.fwd_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        cache_seqlens,
+        cache_batch_idx,
+        softmax_scale,
+        causal,
+    )
+    return out, lse
+
+
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -553,3 +581,68 @@ def flash_attn_varlen_kvpacked_func(
         causal,
         torch.is_grad_enabled(),
     )
+
+
+def flash_attn_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor | int] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    return_softmax_lse: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Contiguous KV-cache attention for inference on SM75.
+
+    This initial implementation supports contiguous cache tensors only. If k and v are provided,
+    they are appended into k_cache and v_cache in place starting at cache_seqlens.
+    """
+    if cache_seqlens is None:
+        raise ValueError("cache_seqlens is required for flash_attn_with_kvcache")
+    if (k is None) != (v is None):
+        raise ValueError("k and v must either both be provided or both be None")
+    if isinstance(cache_seqlens, int):
+        cache_seqlens = torch.full(
+            (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+        )
+    elif not isinstance(cache_seqlens, torch.Tensor):
+        raise TypeError("cache_seqlens must be an int or a torch.Tensor")
+    elif cache_seqlens.dtype != torch.int32:
+        raise TypeError("cache_seqlens must be a torch.int32 tensor")
+    if cache_seqlens.dim() != 1 or cache_seqlens.numel() != q.shape[0]:
+        raise ValueError("cache_seqlens must have shape [batch_size]")
+    if cache_batch_idx is not None:
+        if not isinstance(cache_batch_idx, torch.Tensor):
+            raise TypeError("cache_batch_idx must be a torch.Tensor")
+        if cache_batch_idx.dtype != torch.int32:
+            raise TypeError("cache_batch_idx must be a torch.int32 tensor")
+        if cache_batch_idx.dim() != 1 or cache_batch_idx.numel() != q.shape[0]:
+            raise ValueError("cache_batch_idx must have shape [batch_size]")
+    seqlen_new = 0
+    if k is not None and v is not None:
+        if k.shape[0] != q.shape[0] or v.shape[0] != q.shape[0]:
+            raise ValueError("k and v batch size must match q")
+        if k.shape[1] != v.shape[1]:
+            raise ValueError("k and v sequence length must match")
+        seqlen_new = k.shape[1]
+    max_cache_usage = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
+    if max_cache_usage + seqlen_new > k_cache.shape[1]:
+        raise ValueError("cache capacity is insufficient for the requested append length")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    out, lse = _flash_attn_kvcache_forward(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        cache_seqlens,
+        cache_batch_idx,
+        softmax_scale,
+        causal,
+    )
+    return (out, lse) if return_softmax_lse else out

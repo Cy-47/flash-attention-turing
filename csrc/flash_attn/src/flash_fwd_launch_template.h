@@ -16,6 +16,7 @@ void flash_fwd_kernel(half_t* __restrict__ q,
                           float* __restrict__ l,
                           int* __restrict__ cu_seqlens_q,
                           int* __restrict__ cu_seqlens_k,
+                          int* __restrict__ seqused_k,
                           int batch_size,
                           int seqlen_q,
                           int seqlen_k,
@@ -33,6 +34,7 @@ void flash_fwd_kernel(half_t* __restrict__ q,
                                            l,
                                            cu_seqlens_q,
                                            cu_seqlens_k,
+                                           seqused_k,
                                            batch_size,
                                            seqlen_q,
                                            seqlen_k,
@@ -57,6 +59,7 @@ void run_flash_fwd(Flash_fwd_params &params) {
 
     const bool is_even_MN  = params.cu_seqlens_q == nullptr &&
                              params.cu_seqlens_k == nullptr &&
+                             params.seqused_k == nullptr &&
                              params.seqlen_q % kBlockM == 0 &&
                              params.seqlen_k % kBlockN == 0;
 
@@ -74,6 +77,7 @@ void run_flash_fwd(Flash_fwd_params &params) {
                                                                                     params.l_ptr,
                                                                                     params.cu_seqlens_q,
                                                                                     params.cu_seqlens_k,
+                                                                                    params.seqused_k,
                                                                                     params.b,
                                                                                     params.seqlen_q,
                                                                                     params.seqlen_k,
