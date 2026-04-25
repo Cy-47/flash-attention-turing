@@ -43,6 +43,77 @@ __inline__ __device__ float block_max(float val) {
     return smem[0];
 }
 
+__device__ __forceinline__ bool is_pow2_u32(const unsigned int x) {
+    return x != 0u && (x & (x - 1u)) == 0u;
+}
+
+__device__ __forceinline__ int floor_log2_pow2_u32(const unsigned int x) {
+    return 31 - __clz(x);
+}
+
+template <int Headdim>
+__device__ __forceinline__ float q_dot_k_half2(
+    const float *q_vec, const half *__restrict__ k_row_base) {
+    static_assert(Headdim % 2 == 0, "Headdim must be even for half2 vectorization");
+    float acc = 0.0f;
+    #pragma unroll
+    for (int d = 0; d < Headdim; d += 2) {
+        const half2 k2 = *reinterpret_cast<const half2 *>(k_row_base + d);
+        const float2 kf = __half22float2(k2);
+        acc += q_vec[d] * kf.x + q_vec[d + 1] * kf.y;
+    }
+    return acc;
+}
+
+__device__ __forceinline__ int paged_table_idx(
+    const int pos, const int page_block_size, const bool pbs_is_pow2, const int pbs_lg) {
+    if (pbs_is_pow2) {
+        return pos >> pbs_lg;
+    }
+    return pos / page_block_size;
+}
+
+__device__ __forceinline__ int paged_page_offset(
+    const int pos, const int page_block_size, const bool pbs_is_pow2, const int pbs_lg) {
+    if (pbs_is_pow2) {
+        return pos & (page_block_size - 1);
+    }
+    return pos - (pos / page_block_size) * page_block_size;
+}
+
+__device__ __forceinline__ void paged_advance_in_split(
+    int &table_idx,
+    int &page_offset,
+    int &physical_block,
+    const int pos,
+    const int split_end,
+    const int next_stride,
+    const int batch,
+    const int *block_table,
+    const int64_t block_table_batch_stride,
+    const int page_block_size,
+    const bool pbs_is_pow2,
+    const int pbs_lg) {
+    if (pbs_is_pow2) {
+        const unsigned int mask = static_cast<unsigned int>(page_block_size - 1);
+        int next_off = page_offset + next_stride;
+        if (static_cast<unsigned int>(next_off) > mask) {
+            const unsigned int u = static_cast<unsigned int>(next_off);
+            const int n_wrap = static_cast<int>(u >> pbs_lg);
+            table_idx += n_wrap;
+            next_off = static_cast<int>(u & mask);
+        }
+        page_offset = next_off;
+    } else {
+        const int carry = page_offset + next_stride;
+        table_idx += carry / page_block_size;
+        page_offset = carry - (carry / page_block_size) * page_block_size;
+    }
+    if (pos + next_stride < split_end) {
+        physical_block = block_table[int64_t(batch) * block_table_batch_stride + table_idx];
+    }
+}
+
 __device__ __forceinline__ int64_t dense_kv_offset(
     const int batch,
     const int pos,
@@ -119,6 +190,8 @@ __global__ void kvcache_split_kernel_legacy(
     const int split_start = (seqlen_k * split_idx) / num_splits;
     const int split_end = (seqlen_k * (split_idx + 1)) / num_splits;
     const int causal_limit = q_pos + seqlen_k - seqlen_q;
+    const bool pbs_is_pow2 = is_pow2_u32(static_cast<unsigned int>(page_block_size));
+    const int pbs_lg = pbs_is_pow2 ? floor_log2_pow2_u32(static_cast<unsigned int>(page_block_size)) : 0;
     __shared__ float q_vec[Headdim];
     if (threadIdx.x < Headdim) {
         q_vec[threadIdx.x] = __half2float(q[int64_t(batch) * q_batch_stride
@@ -135,17 +208,14 @@ __global__ void kvcache_split_kernel_legacy(
                 k_base = int64_t(cache_batch) * k_batch_stride + int64_t(pos) * k_row_stride
                     + int64_t(kv_head) * k_head_stride;
             } else {
-                const int table_idx = pos / page_block_size;
-                const int page_offset = pos - table_idx * page_block_size;
+                const int table_idx = paged_table_idx(pos, page_block_size, pbs_is_pow2, pbs_lg);
+                const int page_offset = paged_page_offset(pos, page_block_size, pbs_is_pow2, pbs_lg);
                 const int physical_block =
                     block_table[int64_t(batch) * block_table_batch_stride + table_idx];
                 k_base = int64_t(physical_block) * k_batch_stride + int64_t(page_offset) * k_row_stride
                     + int64_t(kv_head) * k_head_stride;
             }
-            #pragma unroll
-            for (int dim = 0; dim < Headdim; ++dim) {
-                score += q_vec[dim] * __half2float(k_cache[k_base + dim]);
-            }
+            score = q_dot_k_half2<Headdim>(q_vec, k_cache + k_base);
             local_max = fmaxf(local_max, score * softmax_scale);
         }
     }
@@ -161,17 +231,14 @@ __global__ void kvcache_split_kernel_legacy(
                     k_base = int64_t(cache_batch) * k_batch_stride + int64_t(pos) * k_row_stride
                         + int64_t(kv_head) * k_head_stride;
                 } else {
-                    const int table_idx = pos / page_block_size;
-                    const int page_offset = pos - table_idx * page_block_size;
+                    const int table_idx = paged_table_idx(pos, page_block_size, pbs_is_pow2, pbs_lg);
+                    const int page_offset = paged_page_offset(pos, page_block_size, pbs_is_pow2, pbs_lg);
                     const int physical_block =
                         block_table[int64_t(batch) * block_table_batch_stride + table_idx];
                     k_base = int64_t(physical_block) * k_batch_stride + int64_t(page_offset) * k_row_stride
                         + int64_t(kv_head) * k_head_stride;
                 }
-                #pragma unroll
-                for (int dim = 0; dim < Headdim; ++dim) {
-                    score += q_vec[dim] * __half2float(k_cache[k_base + dim]);
-                }
+                score = q_dot_k_half2<Headdim>(q_vec, k_cache + k_base);
                 local_sum += expf(score * softmax_scale - row_max);
             }
         }
@@ -197,8 +264,8 @@ __global__ void kvcache_split_kernel_legacy(
                         v_base = int64_t(cache_batch) * v_batch_stride + int64_t(pos) * v_row_stride
                             + int64_t(kv_head) * v_head_stride;
                     } else {
-                        const int table_idx = pos / page_block_size;
-                        const int page_offset = pos - table_idx * page_block_size;
+                        const int table_idx = paged_table_idx(pos, page_block_size, pbs_is_pow2, pbs_lg);
+                        const int page_offset = paged_page_offset(pos, page_block_size, pbs_is_pow2, pbs_lg);
                         const int physical_block =
                             block_table[int64_t(batch) * block_table_batch_stride + table_idx];
                         k_base = int64_t(physical_block) * k_batch_stride + int64_t(page_offset) * k_row_stride
@@ -206,10 +273,7 @@ __global__ void kvcache_split_kernel_legacy(
                         v_base = int64_t(physical_block) * v_batch_stride + int64_t(page_offset) * v_row_stride
                             + int64_t(kv_head) * v_head_stride;
                     }
-                    #pragma unroll
-                    for (int kdim = 0; kdim < Headdim; ++kdim) {
-                        score += q_vec[kdim] * __half2float(k_cache[k_base + kdim]);
-                    }
+                    score = q_dot_k_half2<Headdim>(q_vec, k_cache + k_base);
                     const float p = expf(score * softmax_scale - row_lse);
                     local_out += p * __half2float(v_cache[v_base + dim]);
                 }
@@ -280,6 +344,8 @@ __global__ void kvcache_split_kernel(
     const int split_end = (seqlen_k * (split_idx + 1)) / num_splits;
     const int split_len = split_end - split_start;
     const int causal_limit = q_pos + seqlen_k - seqlen_q;
+    const bool pbs_is_pow2 = is_pow2_u32(static_cast<unsigned int>(page_block_size));
+    const int pbs_lg = pbs_is_pow2 ? floor_log2_pow2_u32(static_cast<unsigned int>(page_block_size)) : 0;
     __shared__ float q_vec[Headdim];
     if (threadIdx.x < Headdim) {
         q_vec[threadIdx.x] = __half2float(q[int64_t(batch) * q_batch_stride
@@ -311,8 +377,8 @@ __global__ void kvcache_split_kernel(
     int physical_block = -1;
     if (block_table != nullptr) {
         const int start_pos = split_start + threadIdx.x;
-        table_idx = start_pos / page_block_size;
-        page_offset = start_pos - table_idx * page_block_size;
+        table_idx = paged_table_idx(start_pos, page_block_size, pbs_is_pow2, pbs_lg);
+        page_offset = paged_page_offset(start_pos, page_block_size, pbs_is_pow2, pbs_lg);
         if (start_pos < split_end) {
             physical_block = block_table[int64_t(batch) * block_table_batch_stride + table_idx];
         }
@@ -328,22 +394,15 @@ __global__ void kvcache_split_kernel(
                 k_base = int64_t(physical_block) * k_batch_stride + int64_t(page_offset) * k_row_stride
                     + int64_t(kv_head) * k_head_stride;
             }
-            float dot = 0.0f;
-            #pragma unroll
-            for (int dim = 0; dim < Headdim; ++dim) {
-                dot += q_vec[dim] * __half2float(k_cache[k_base + dim]);
-            }
+            const float dot = q_dot_k_half2<Headdim>(q_vec, k_cache + k_base);
             score = dot * softmax_scale;
         }
         scores[pos - split_start] = score;
         local_max = fmaxf(local_max, score);
         if (block_table != nullptr) {
-            const int carry = page_offset + blockDim.x;
-            table_idx += carry / page_block_size;
-            page_offset = carry - (carry / page_block_size) * page_block_size;
-            if (pos + blockDim.x < split_end) {
-                physical_block = block_table[int64_t(batch) * block_table_batch_stride + table_idx];
-            }
+            paged_advance_in_split(
+                table_idx, page_offset, physical_block, pos, split_end, blockDim.x, batch, block_table,
+                block_table_batch_stride, page_block_size, pbs_is_pow2, pbs_lg);
         }
     }
     const float row_max = block_max<kThreads>(local_max);
@@ -375,8 +434,8 @@ __global__ void kvcache_split_kernel(
         int v_physical_block = -1;
         if (block_table != nullptr) {
             const int start_pos = split_start + threadIdx.x;
-            v_table_idx = start_pos / page_block_size;
-            v_page_offset = start_pos - v_table_idx * page_block_size;
+            v_table_idx = paged_table_idx(start_pos, page_block_size, pbs_is_pow2, pbs_lg);
+            v_page_offset = paged_page_offset(start_pos, page_block_size, pbs_is_pow2, pbs_lg);
             if (start_pos < split_end) {
                 v_physical_block = block_table[int64_t(batch) * block_table_batch_stride + v_table_idx];
             }
@@ -393,12 +452,9 @@ __global__ void kvcache_split_kernel(
             }
             local_out += p * __half2float(v_cache[v_base + dim]);
             if (block_table != nullptr) {
-                const int carry = v_page_offset + blockDim.x;
-                v_table_idx += carry / page_block_size;
-                v_page_offset = carry - (carry / page_block_size) * page_block_size;
-                if (pos + blockDim.x < split_end) {
-                    v_physical_block = block_table[int64_t(batch) * block_table_batch_stride + v_table_idx];
-                }
+                paged_advance_in_split(
+                    v_table_idx, v_page_offset, v_physical_block, pos, split_end, blockDim.x, batch, block_table,
+                    block_table_batch_stride, page_block_size, pbs_is_pow2, pbs_lg);
             }
         }
         const float dim_out = block_sum<kThreads>(local_out);
@@ -459,6 +515,8 @@ __global__ void kvcache_decode_split_kernel(
     const int split_start = (seqlen_k * split_idx) / num_splits;
     const int split_end = (seqlen_k * (split_idx + 1)) / num_splits;
     const int split_len = split_end - split_start;
+    const bool pbs_is_pow2 = is_pow2_u32(static_cast<unsigned int>(page_block_size));
+    const int pbs_lg = pbs_is_pow2 ? floor_log2_pow2_u32(static_cast<unsigned int>(page_block_size)) : 0;
 
     if (split_len <= 0) {
         if (threadIdx.x == 0) {
@@ -484,8 +542,8 @@ __global__ void kvcache_decode_split_kernel(
             + int64_t(0) * q_row_stride + int64_t(head) * q_head_stride + dim]);
     }
 
-    int table_idx_k = split_start / page_block_size;
-    int page_offset_k = split_start - table_idx_k * page_block_size;
+    int table_idx_k = paged_table_idx(split_start, page_block_size, pbs_is_pow2, pbs_lg);
+    int page_offset_k = paged_page_offset(split_start, page_block_size, pbs_is_pow2, pbs_lg);
     int physical_block_k = -1;
     if (block_table != nullptr && split_len > 0) {
         physical_block_k = block_table[int64_t(batch) * block_table_batch_stride + table_idx_k];
@@ -510,12 +568,10 @@ __global__ void kvcache_decode_split_kernel(
         }
         __syncthreads();
         if (block_table != nullptr) {
-            page_offset_k += 1;
-            if (page_offset_k == page_block_size && pos_idx + 1 < split_len) {
-                table_idx_k += 1;
-                page_offset_k = 0;
-                physical_block_k = block_table[int64_t(batch) * block_table_batch_stride + table_idx_k];
-            }
+            const int pos = split_start + pos_idx;
+            paged_advance_in_split(
+                table_idx_k, page_offset_k, physical_block_k, pos, split_end, 1, batch, block_table,
+                block_table_batch_stride, page_block_size, pbs_is_pow2, pbs_lg);
         }
     }
 
@@ -548,8 +604,8 @@ __global__ void kvcache_decode_split_kernel(
 
     if (dim < Headdim) {
         float out_val = 0.0f;
-        int table_idx_v = split_start / page_block_size;
-        int page_offset_v = split_start - table_idx_v * page_block_size;
+        int table_idx_v = paged_table_idx(split_start, page_block_size, pbs_is_pow2, pbs_lg);
+        int page_offset_v = paged_page_offset(split_start, page_block_size, pbs_is_pow2, pbs_lg);
         int physical_block_v = -1;
         if (block_table != nullptr && split_len > 0) {
             physical_block_v = block_table[int64_t(batch) * block_table_batch_stride + table_idx_v];
@@ -566,12 +622,10 @@ __global__ void kvcache_decode_split_kernel(
             }
             out_val += scores[pos_idx] * __half2float(v_cache[v_base + dim]);
             if (block_table != nullptr) {
-                page_offset_v += 1;
-                if (page_offset_v == page_block_size && pos_idx + 1 < split_len) {
-                    table_idx_v += 1;
-                    page_offset_v = 0;
-                    physical_block_v = block_table[int64_t(batch) * block_table_batch_stride + table_idx_v];
-                }
+                const int pos = split_start + pos_idx;
+                paged_advance_in_split(
+                    table_idx_v, page_offset_v, physical_block_v, pos, split_end, 1, batch, block_table,
+                    block_table_batch_stride, page_block_size, pbs_is_pow2, pbs_lg);
             }
         }
         if (s_row_lse != -INFINITY) {
@@ -723,34 +777,69 @@ __global__ void paged_append_kernel(
     const int64_t v_new_head_stride,
     const int64_t block_table_batch_stride) {
     const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t elems_per_batch = int64_t(seqlen_new) * nheads_k * head_dim;
-    const int64_t total = int64_t(batch_size) * elems_per_batch;
-    if (idx >= total) {
-        return;
+    if (head_dim % 2 == 0) {
+        const int h2 = head_dim / 2;
+        const int64_t elems_per_batch = int64_t(seqlen_new) * nheads_k * h2;
+        const int64_t total = int64_t(batch_size) * elems_per_batch;
+        if (idx >= total) {
+            return;
+        }
+        const bool pbs_is_pow2 = is_pow2_u32(static_cast<unsigned int>(page_block_size));
+        const int pbs_lg = pbs_is_pow2 ? floor_log2_pow2_u32(static_cast<unsigned int>(page_block_size)) : 0;
+        const int batch = static_cast<int>(idx / elems_per_batch);
+        const int64_t rem0 = idx - int64_t(batch) * elems_per_batch;
+        const int token = static_cast<int>(rem0 / (nheads_k * h2));
+        const int64_t rem1 = rem0 - int64_t(token) * nheads_k * h2;
+        const int kv_head = static_cast<int>(rem1 / h2);
+        const int dim_pair = static_cast<int>(rem1 - int64_t(kv_head) * h2);
+        const int dim = dim_pair * 2;
+
+        const int logical_pos = cache_seqlens[batch] + token;
+        const int table_idx = paged_table_idx(logical_pos, page_block_size, pbs_is_pow2, pbs_lg);
+        const int page_offset = paged_page_offset(logical_pos, page_block_size, pbs_is_pow2, pbs_lg);
+        const int physical_block = block_table[int64_t(batch) * block_table_batch_stride + table_idx];
+
+        const int64_t src_k = int64_t(batch) * k_new_batch_stride + int64_t(token) * k_new_row_stride
+            + int64_t(kv_head) * k_new_head_stride + dim;
+        const int64_t src_v = int64_t(batch) * v_new_batch_stride + int64_t(token) * v_new_row_stride
+            + int64_t(kv_head) * v_new_head_stride + dim;
+        const int64_t dst_k = int64_t(physical_block) * k_cache_block_stride + int64_t(page_offset) * k_cache_row_stride
+            + int64_t(kv_head) * k_cache_head_stride + dim;
+        const int64_t dst_v = int64_t(physical_block) * v_cache_block_stride + int64_t(page_offset) * v_cache_row_stride
+            + int64_t(kv_head) * v_cache_head_stride + dim;
+        *reinterpret_cast<half2 *>(k_cache + dst_k) = *reinterpret_cast<const half2 *>(k_new + src_k);
+        *reinterpret_cast<half2 *>(v_cache + dst_v) = *reinterpret_cast<const half2 *>(v_new + src_v);
+    } else {
+        const int64_t elems_per_batch = int64_t(seqlen_new) * nheads_k * head_dim;
+        const int64_t total = int64_t(batch_size) * elems_per_batch;
+        if (idx >= total) {
+            return;
+        }
+        const bool pbs_is_pow2 = is_pow2_u32(static_cast<unsigned int>(page_block_size));
+        const int pbs_lg = pbs_is_pow2 ? floor_log2_pow2_u32(static_cast<unsigned int>(page_block_size)) : 0;
+        const int batch = static_cast<int>(idx / elems_per_batch);
+        const int64_t rem0 = idx - int64_t(batch) * elems_per_batch;
+        const int token = static_cast<int>(rem0 / (nheads_k * head_dim));
+        const int64_t rem1 = rem0 - int64_t(token) * nheads_k * head_dim;
+        const int kv_head = static_cast<int>(rem1 / head_dim);
+        const int dim = static_cast<int>(rem1 - int64_t(kv_head) * head_dim);
+
+        const int logical_pos = cache_seqlens[batch] + token;
+        const int table_idx = paged_table_idx(logical_pos, page_block_size, pbs_is_pow2, pbs_lg);
+        const int page_offset = paged_page_offset(logical_pos, page_block_size, pbs_is_pow2, pbs_lg);
+        const int physical_block = block_table[int64_t(batch) * block_table_batch_stride + table_idx];
+
+        const int64_t src_k = int64_t(batch) * k_new_batch_stride + int64_t(token) * k_new_row_stride
+            + int64_t(kv_head) * k_new_head_stride + dim;
+        const int64_t src_v = int64_t(batch) * v_new_batch_stride + int64_t(token) * v_new_row_stride
+            + int64_t(kv_head) * v_new_head_stride + dim;
+        const int64_t dst_k = int64_t(physical_block) * k_cache_block_stride + int64_t(page_offset) * k_cache_row_stride
+            + int64_t(kv_head) * k_cache_head_stride + dim;
+        const int64_t dst_v = int64_t(physical_block) * v_cache_block_stride + int64_t(page_offset) * v_cache_row_stride
+            + int64_t(kv_head) * v_cache_head_stride + dim;
+        k_cache[dst_k] = k_new[src_k];
+        v_cache[dst_v] = v_new[src_v];
     }
-
-    const int batch = idx / elems_per_batch;
-    const int64_t rem0 = idx - int64_t(batch) * elems_per_batch;
-    const int token = rem0 / (nheads_k * head_dim);
-    const int rem1 = rem0 - int64_t(token) * nheads_k * head_dim;
-    const int kv_head = rem1 / head_dim;
-    const int dim = rem1 - kv_head * head_dim;
-
-    const int logical_pos = cache_seqlens[batch] + token;
-    const int table_idx = logical_pos / page_block_size;
-    const int page_offset = logical_pos - table_idx * page_block_size;
-    const int physical_block = block_table[int64_t(batch) * block_table_batch_stride + table_idx];
-
-    const int64_t src_k = int64_t(batch) * k_new_batch_stride + int64_t(token) * k_new_row_stride
-        + int64_t(kv_head) * k_new_head_stride + dim;
-    const int64_t src_v = int64_t(batch) * v_new_batch_stride + int64_t(token) * v_new_row_stride
-        + int64_t(kv_head) * v_new_head_stride + dim;
-    const int64_t dst_k = int64_t(physical_block) * k_cache_block_stride + int64_t(page_offset) * k_cache_row_stride
-        + int64_t(kv_head) * k_cache_head_stride + dim;
-    const int64_t dst_v = int64_t(physical_block) * v_cache_block_stride + int64_t(page_offset) * v_cache_row_stride
-        + int64_t(kv_head) * v_cache_head_stride + dim;
-    k_cache[dst_k] = k_new[src_k];
-    v_cache[dst_v] = v_new[src_v];
 }
 
 int choose_num_splits(
@@ -802,7 +891,11 @@ void run_kvcache_paged_append(
     const int nheads_k = k_new.size(2);
     const int head_dim = k_new.size(3);
     const int page_block_size = k_cache.size(1);
-    const int64_t total = int64_t(batch_size) * seqlen_new * nheads_k * head_dim;
+    const int64_t elems_per =
+        (head_dim % 2 == 0)
+            ? (int64_t(seqlen_new) * nheads_k * (head_dim / 2))
+            : (int64_t(seqlen_new) * nheads_k * head_dim);
+    const int64_t total = int64_t(batch_size) * elems_per;
     const int threads = 256;
     const int blocks = (total + threads - 1) / threads;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
