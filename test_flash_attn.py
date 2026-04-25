@@ -533,6 +533,68 @@ def _kvcache_reference(
     return torch.cat(outputs, dim=0)
 
 
+def _make_paged_kvcache(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    page_block_size: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, seqlen_cache, nheads_k, head_dim = k_cache.shape
+    max_num_blocks_per_seq = (seqlen_cache + page_block_size - 1) // page_block_size
+    num_blocks = batch_size * max_num_blocks_per_seq
+    k_paged = torch.zeros(
+        num_blocks,
+        page_block_size,
+        nheads_k,
+        head_dim,
+        device=k_cache.device,
+        dtype=k_cache.dtype,
+    )
+    v_paged = torch.zeros_like(k_paged)
+    block_table = torch.arange(num_blocks, device=k_cache.device, dtype=torch.int32).reshape(
+        batch_size, max_num_blocks_per_seq
+    )
+    for batch_idx in range(batch_size):
+        for block_idx in range(max_num_blocks_per_seq):
+            start = block_idx * page_block_size
+            end = min(start + page_block_size, seqlen_cache)
+            if start >= end:
+                continue
+            physical_block = int(block_table[batch_idx, block_idx].item())
+            k_paged[physical_block, : end - start].copy_(k_cache[batch_idx, start:end])
+            v_paged[physical_block, : end - start].copy_(v_cache[batch_idx, start:end])
+    return k_paged, v_paged, block_table
+
+
+def _materialize_paged_kvcache(
+    k_paged: torch.Tensor,
+    v_paged: torch.Tensor,
+    block_table: torch.Tensor,
+    seqlen_cache: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size, max_num_blocks_per_seq = block_table.shape
+    page_block_size = k_paged.shape[1]
+    k_cache = torch.empty(
+        batch_size,
+        seqlen_cache,
+        k_paged.shape[2],
+        k_paged.shape[3],
+        device=k_paged.device,
+        dtype=k_paged.dtype,
+    )
+    v_cache = torch.empty_like(k_cache)
+    for batch_idx in range(batch_size):
+        for block_idx in range(max_num_blocks_per_seq):
+            start = block_idx * page_block_size
+            end = min(start + page_block_size, seqlen_cache)
+            if start >= end:
+                continue
+            physical_block = int(block_table[batch_idx, block_idx].item())
+            k_cache[batch_idx, start:end].copy_(k_paged[physical_block, : end - start])
+            v_cache[batch_idx, start:end].copy_(v_paged[physical_block, : end - start])
+    return k_cache, v_cache
+
+
 def _bundle_from_tensors(
     output: torch.Tensor,
     dq: torch.Tensor,
@@ -1089,13 +1151,315 @@ def test_flash_attn_kvcache_append(
     torch.testing.assert_close(v_cache, v_cache_ref, atol=1e-3, rtol=1e-3)
 
 
-def test_flash_attn_kvcache_requires_cache_seqlens() -> None:
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("nheads, nheads_k", [(4, 2), (6, 1)])
+@pytest.mark.parametrize("causal", CAUSAL_FLAGS)
+@pytest.mark.parametrize("num_splits", [0, 1, 2, 3])
+def test_flash_attn_kvcache_splitkv(
+    nheads: int,
+    nheads_k: int,
+    head_dim: int,
+    causal: bool,
+    num_splits: int,
+    dtype: torch.dtype,
+) -> None:
+    device = _cuda_device()
+    batch_size = 2
+    seqlen_q = 4
+    seqlen_cache = 31
+    cache_lengths = [17, 29]
+
+    q = torch.randn(batch_size, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    v_cache = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    cache_seqlens = torch.tensor(cache_lengths, device=device, dtype=torch.int32)
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        causal=causal,
+        num_splits=num_splits,
+    )
+    torch.cuda.synchronize()
+
+    out_ref = _kvcache_reference(
+        q,
+        k_cache.clone(),
+        v_cache.clone(),
+        cache_lengths,
+        causal=causal,
+        softmax_scale=None,
+    )
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("nheads, nheads_k", [(4, 2), (6, 1)])
+@pytest.mark.parametrize("causal", CAUSAL_FLAGS)
+@pytest.mark.parametrize("num_splits", [0, 2])
+def test_flash_attn_kvcache_paged_read(
+    nheads: int,
+    nheads_k: int,
+    head_dim: int,
+    causal: bool,
+    num_splits: int,
+    dtype: torch.dtype,
+) -> None:
+    device = _cuda_device()
+    batch_size = 2
+    seqlen_q = 4
+    seqlen_cache = 300
+    cache_lengths = [123, 257]
+
+    q = torch.randn(batch_size, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
+    k_dense = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    v_dense = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    k_paged, v_paged, block_table = _make_paged_kvcache(k_dense, v_dense)
+    cache_seqlens = torch.tensor(cache_lengths, device=device, dtype=torch.int32)
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_paged,
+        v_paged,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        causal=causal,
+        num_splits=num_splits,
+    )
+    torch.cuda.synchronize()
+
+    out_ref = _kvcache_reference(
+        q,
+        k_dense,
+        v_dense,
+        cache_lengths,
+        causal=causal,
+        softmax_scale=None,
+    )
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("nheads, nheads_k", [(4, 2)])
+@pytest.mark.parametrize("causal", CAUSAL_FLAGS)
+def test_flash_attn_kvcache_paged_append(
+    nheads: int,
+    nheads_k: int,
+    head_dim: int,
+    causal: bool,
+    dtype: torch.dtype,
+) -> None:
+    device = _cuda_device()
+    batch_size = 2
+    seqlen_q = 4
+    seqlen_cache = 300
+    append_len = 3
+    cache_lengths = [123, 250]
+
+    q = torch.randn(batch_size, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
+    k_dense = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    v_dense = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    k_new = torch.randn(batch_size, append_len, nheads_k, head_dim, device=device, dtype=dtype)
+    v_new = torch.randn(batch_size, append_len, nheads_k, head_dim, device=device, dtype=dtype)
+    k_paged, v_paged, block_table = _make_paged_kvcache(k_dense, v_dense)
+    cache_seqlens = torch.tensor(cache_lengths, device=device, dtype=torch.int32)
+
+    k_dense_ref = k_dense.clone()
+    v_dense_ref = v_dense.clone()
+    for batch_idx, start in enumerate(cache_lengths):
+        k_dense_ref[batch_idx, start : start + append_len] = k_new[batch_idx]
+        v_dense_ref[batch_idx, start : start + append_len] = v_new[batch_idx]
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_paged,
+        v_paged,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        causal=causal,
+        num_splits=2,
+    )
+    torch.cuda.synchronize()
+
+    out_ref = _kvcache_reference(
+        q,
+        k_dense.clone(),
+        v_dense.clone(),
+        cache_lengths,
+        k_new=k_new,
+        v_new=v_new,
+        causal=causal,
+        softmax_scale=None,
+    )
+    k_dense_after, v_dense_after = _materialize_paged_kvcache(
+        k_paged, v_paged, block_table, seqlen_cache
+    )
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_dense_after, k_dense_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(v_dense_after, v_dense_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("nheads, nheads_k", [(4, 2), (6, 1)])
+@pytest.mark.parametrize("causal", CAUSAL_FLAGS)
+@pytest.mark.parametrize("num_splits", [0, 1, 2, 4, 8])
+def test_flash_attn_kvcache_splitkv_randomized_lengths(
+    nheads: int,
+    nheads_k: int,
+    head_dim: int,
+    causal: bool,
+    num_splits: int,
+    dtype: torch.dtype,
+) -> None:
+    device = _cuda_device()
+    torch.manual_seed(0)
+    batch_size = 3
+    seqlen_q = 7
+    seqlen_cache = 321
+    q = torch.randn(batch_size, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    v_cache = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+
+    for _ in range(8):
+        cache_lengths = torch.randint(
+            low=32,
+            high=seqlen_cache - 1,
+            size=(batch_size,),
+            device=device,
+            dtype=torch.int32,
+        )
+        out = flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_lengths,
+            causal=causal,
+            num_splits=num_splits,
+        )
+        out_ref = _kvcache_reference(
+            q,
+            k_cache.clone(),
+            v_cache.clone(),
+            cache_lengths.detach().cpu().tolist(),
+            causal=causal,
+            softmax_scale=None,
+        )
+        torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("nheads, nheads_k", [(4, 2)])
+@pytest.mark.parametrize("causal", CAUSAL_FLAGS)
+@pytest.mark.parametrize("num_splits", [0, 2, 4])
+@pytest.mark.parametrize("page_block_size", [256, 512])
+def test_flash_attn_kvcache_paged_randomized_lengths(
+    nheads: int,
+    nheads_k: int,
+    head_dim: int,
+    causal: bool,
+    num_splits: int,
+    page_block_size: int,
+    dtype: torch.dtype,
+) -> None:
+    device = _cuda_device()
+    torch.manual_seed(0)
+    batch_size = 2
+    seqlen_q = 5
+    seqlen_cache = page_block_size * 3
+    q = torch.randn(batch_size, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
+    k_dense = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    v_dense = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    k_paged, v_paged, block_table = _make_paged_kvcache(
+        k_dense, v_dense, page_block_size=page_block_size
+    )
+
+    for _ in range(6):
+        cache_lengths = torch.randint(
+            low=page_block_size // 2,
+            high=seqlen_cache - 1,
+            size=(batch_size,),
+            device=device,
+            dtype=torch.int32,
+        )
+        out = flash_attn_with_kvcache(
+            q,
+            k_paged.clone(),
+            v_paged.clone(),
+            cache_seqlens=cache_lengths,
+            block_table=block_table,
+            causal=causal,
+            num_splits=num_splits,
+        )
+        out_ref = _kvcache_reference(
+            q,
+            k_dense.clone(),
+            v_dense.clone(),
+            cache_lengths.detach().cpu().tolist(),
+            causal=causal,
+            softmax_scale=None,
+        )
+        torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_flash_attn_kvcache_paged_decode_long_context_no_error(
+    head_dim: int,
+    dtype: torch.dtype,
+) -> None:
+    device = _cuda_device()
+    torch.manual_seed(0)
+    batch_size = 2
+    seqlen_q = 1
+    seqlen_cache = 16384
+    nheads = 6
+    nheads_k = 1
+    page_block_size = 512
+    q = torch.randn(batch_size, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
+    k_dense = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    v_dense = torch.randn(batch_size, seqlen_cache, nheads_k, head_dim, device=device, dtype=dtype)
+    k_paged, v_paged, block_table = _make_paged_kvcache(
+        k_dense, v_dense, page_block_size=page_block_size
+    )
+    cache_lengths = torch.full((batch_size,), seqlen_cache - 1, device=device, dtype=torch.int32)
+    out = flash_attn_with_kvcache(
+        q,
+        k_paged,
+        v_paged,
+        cache_seqlens=cache_lengths,
+        block_table=block_table,
+        causal=True,
+        num_splits=0,  # heuristic path should remain launch-safe at long context.
+    )
+    out_ref = _kvcache_reference(
+        q,
+        k_dense.clone(),
+        v_dense.clone(),
+        cache_lengths.detach().cpu().tolist(),
+        causal=True,
+        softmax_scale=None,
+    )
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+
+def test_flash_attn_kvcache_requires_cache_seqlens_for_append() -> None:
     q = torch.randn(1, 2, 4, 64)
     k_cache = torch.randn(1, 8, 2, 64)
     v_cache = torch.randn(1, 8, 2, 64)
+    k = torch.randn(1, 1, 2, 64)
+    v = torch.randn(1, 1, 2, 64)
 
-    with pytest.raises(ValueError, match="cache_seqlens is required"):
-        flash_attn_with_kvcache(q, k_cache, v_cache)
+    with pytest.raises(ValueError, match="cache_seqlens is required when appending"):
+        flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v)
 
 
 def test_flash_attn_kvcache_requires_paired_kv() -> None:

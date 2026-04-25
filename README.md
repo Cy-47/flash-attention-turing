@@ -10,7 +10,8 @@ Supports:
  - head dim 64, 128
  - causal mask
  - gqa
- - contiguous inference-only kv cache
+ - contiguous and paged inference-only kv cache
+ - split-KV cache reads
  - varlen
 
 Does not support:
@@ -18,7 +19,6 @@ Does not support:
  - dropout
  - local mask
  - kv cache backward
- - paged kv cache
  - rotary / alibi / leftpad in kv cache mode
 
 ## Performance
@@ -64,9 +64,9 @@ from flash_attention_interface import (
 ```
 
 
-The arguments for these functions differ from the standard FlashAttention Python API because this implementation does not support every feature yet. See `turing/flash_attention_interface.py` for the full function signatures and parameter descriptions.
+The `flash_attn_with_kvcache` signature matches the standard FlashAttention Python API. Other functions keep the smaller Turing-specific signatures because this implementation does not support every mainline feature yet. See `flash_attention_interface.py` for the full function signatures and parameter descriptions.
 
-`flash_attn_with_kvcache` currently supports contiguous cache tensors only and is intended for inference. If `k` and `v` are provided, they are appended into `k_cache` and `v_cache` in place starting at `cache_seqlens`, then attention runs against the updated cache. The API also supports `cache_batch_idx` to remap query rows onto cache rows. This path does not provide backward support and still keeps a smaller feature set than the full mainline FlashAttention KV-cache API.
+`flash_attn_with_kvcache` supports contiguous cache tensors, paged cache tensors through `block_table`, `num_splits` for split-KV cache reads, and `cache_batch_idx` for contiguous cache row remapping. If `k` and `v` are provided, they are appended into `k_cache` and `v_cache` in place starting at `cache_seqlens`, then attention runs against the updated cache. This path does not provide backward support. Rotary embeddings, ALiBi, local window attention, softcap, and `cache_leftpad` are accepted in the API but rejected with clear errors until the Turing kernels support them.
 
 
 ## Requirements

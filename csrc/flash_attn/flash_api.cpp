@@ -5,6 +5,19 @@
 
 namespace py = pybind11;
 
+std::vector<at::Tensor> run_mha_fwd_kvcache_native(
+    at::Tensor q,
+    at::Tensor k_cache,
+    at::Tensor v_cache,
+    at::Tensor cache_seqlens,
+    at::Tensor cache_batch_idx,
+    bool has_cache_batch_idx,
+    at::Tensor block_table,
+    bool has_block_table,
+    const float softmax_scale,
+    bool is_causal,
+    int requested_num_splits);
+
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -70,6 +83,8 @@ void set_params_fprop(Flash_fwd_params &params,
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
     params.seqused_k = static_cast<int *>(seqused_k_d);
+    params.page_block_size = 1;
+    params.num_splits = 1;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -475,10 +490,32 @@ mha_fwd_kvcache(at::Tensor q,
                 py::object k_obj,
                 py::object v_obj,
                 at::Tensor cache_seqlens,
+                py::object rotary_cos_obj,
+                py::object rotary_sin_obj,
                 py::object cache_batch_idx_obj,
+                py::object cache_leftpad_obj,
+                py::object block_table_obj,
+                py::object alibi_slopes_obj,
+                py::object out_obj,
                 const float softmax_scale,
-                bool is_causal)
+                bool is_causal,
+                int window_size_left,
+                int window_size_right,
+                const float softcap,
+                bool rotary_interleaved,
+                int num_splits)
 {
+    (void)rotary_interleaved;
+    TORCH_CHECK(rotary_cos_obj.is_none() && rotary_sin_obj.is_none(),
+                "Turing KV-cache does not support rotary embeddings yet");
+    TORCH_CHECK(cache_leftpad_obj.is_none(), "Turing KV-cache does not support cache_leftpad yet");
+    TORCH_CHECK(alibi_slopes_obj.is_none(), "Turing KV-cache does not support ALiBi yet");
+    TORCH_CHECK(out_obj.is_none(), "Turing KV-cache does not support a preallocated output tensor yet");
+    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
+                "Turing KV-cache does not support local window attention yet");
+    TORCH_CHECK(softcap == 0.0f, "Turing KV-cache does not support softcap yet");
+    TORCH_CHECK(num_splits >= 0, "num_splits must be non-negative");
+
     TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(), "q, k_cache, v_cache must be CUDA tensors");
     TORCH_CHECK(q.scalar_type() == torch::kFloat16 && k_cache.scalar_type() == torch::kFloat16 && v_cache.scalar_type() == torch::kFloat16,
                 "q, k_cache, v_cache must be float16 tensors");
@@ -501,15 +538,32 @@ mha_fwd_kvcache(at::Tensor q,
     const int batch_size = q.size(0);
     const int seqlen_q = q.size(1);
     const int num_heads = q.size(2);
-    const int seqlen_cache = k_cache.size(1);
     const int num_heads_k = k_cache.size(2);
     const int head_size = q.size(3);
-    const int batch_size_cache = k_cache.size(0);
+    const bool has_block_table = !block_table_obj.is_none();
+    at::Tensor block_table;
+    int page_block_size = 1;
+    int seqlen_cache = k_cache.size(1);
+    int batch_size_cache = k_cache.size(0);
+    if (has_block_table)
+    {
+        block_table = block_table_obj.cast<at::Tensor>();
+        TORCH_CHECK(block_table.is_cuda(), "block_table must be a CUDA tensor");
+        TORCH_CHECK(block_table.scalar_type() == torch::kInt32, "block_table must be an int32 tensor");
+        TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
+        TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) == batch_size,
+                    "block_table must have shape [batch_size, max_num_blocks_per_seq]");
+        page_block_size = k_cache.size(1);
+        TORCH_CHECK(page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
+        seqlen_cache = block_table.size(1) * page_block_size;
+        batch_size_cache = batch_size;
+    }
 
     at::Tensor cache_batch_idx;
     const bool has_cache_batch_idx = !cache_batch_idx_obj.is_none();
     if (has_cache_batch_idx)
     {
+        TORCH_CHECK(!has_block_table, "Paged KV cache does not support cache_batch_idx");
         cache_batch_idx = cache_batch_idx_obj.cast<at::Tensor>();
         TORCH_CHECK(cache_batch_idx.is_cuda(), "cache_batch_idx must be a CUDA tensor");
         TORCH_CHECK(cache_batch_idx.scalar_type() == torch::kInt32, "cache_batch_idx must be an int32 tensor");
@@ -563,7 +617,7 @@ mha_fwd_kvcache(at::Tensor q,
         }
     }
 
-    if (has_k)
+    if (has_k && !has_block_table)
     {
         at::Tensor cache_seqlens_cpu = cache_seqlens.to(torch::TensorOptions().device(torch::kCPU));
         auto cache_ptr = cache_seqlens_cpu.data_ptr<int>();
@@ -574,6 +628,45 @@ mha_fwd_kvcache(at::Tensor q,
             k_cache[cache_row].narrow(0, start, seqlen_new).copy_(k[batch_idx]);
             v_cache[cache_row].narrow(0, start, seqlen_new).copy_(v[batch_idx]);
         }
+    }
+    else if (has_k)
+    {
+        at::Tensor cache_seqlens_cpu = cache_seqlens.to(torch::TensorOptions().device(torch::kCPU));
+        at::Tensor block_table_cpu = block_table.to(torch::TensorOptions().device(torch::kCPU));
+        auto cache_ptr = cache_seqlens_cpu.data_ptr<int>();
+        auto block_ptr = block_table_cpu.data_ptr<int>();
+        const int block_table_stride = block_table.stride(0);
+        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx)
+        {
+            const int start = cache_ptr[batch_idx];
+            for (int token_idx = 0; token_idx < seqlen_new; ++token_idx)
+            {
+                const int logical_pos = start + token_idx;
+                const int table_idx = logical_pos / page_block_size;
+                const int page_offset = logical_pos - table_idx * page_block_size;
+                const int physical_block = block_ptr[batch_idx * block_table_stride + table_idx];
+                k_cache[physical_block][page_offset].copy_(k[batch_idx][token_idx]);
+                v_cache[physical_block][page_offset].copy_(v[batch_idx][token_idx]);
+            }
+        }
+    }
+
+    const bool use_native_kvcache = has_block_table || num_splits > 1;
+    if (use_native_kvcache)
+    {
+        at::Tensor empty;
+        return run_mha_fwd_kvcache_native(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens_end,
+            has_cache_batch_idx ? cache_batch_idx : empty,
+            has_cache_batch_idx,
+            has_block_table ? block_table : empty,
+            has_block_table,
+            softmax_scale,
+            is_causal,
+            num_splits);
     }
 
     at::Tensor k_cache_used = has_cache_batch_idx

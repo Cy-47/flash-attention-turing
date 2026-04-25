@@ -47,7 +47,13 @@ struct Flash_fwd_params : public Qkv_params
 
     // The pointer to the softmax sum.
     float *__restrict__ l_ptr;
+    float *__restrict__ l_accum_ptr;
+    float *__restrict__ o_accum_ptr;
     int *__restrict__ seqused_k;
+    int *__restrict__ block_table;
+    index_t block_table_batch_stride;
+    int page_block_size;
+    int num_splits;
     float softmax_scale;
     int b, seqlen_q, seqlen_k, d;
     bool is_causal;
