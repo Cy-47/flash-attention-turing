@@ -18,6 +18,14 @@ std::vector<at::Tensor> run_mha_fwd_kvcache_native(
     bool is_causal,
     int requested_num_splits);
 
+void run_kvcache_paged_append(
+    at::Tensor k_cache,
+    at::Tensor v_cache,
+    at::Tensor k_new,
+    at::Tensor v_new,
+    at::Tensor cache_seqlens,
+    at::Tensor block_table);
+
 void set_params_fprop(Flash_fwd_params &params,
                       // sizes
                       const size_t b,
@@ -631,24 +639,7 @@ mha_fwd_kvcache(at::Tensor q,
     }
     else if (has_k)
     {
-        at::Tensor cache_seqlens_cpu = cache_seqlens.to(torch::TensorOptions().device(torch::kCPU));
-        at::Tensor block_table_cpu = block_table.to(torch::TensorOptions().device(torch::kCPU));
-        auto cache_ptr = cache_seqlens_cpu.data_ptr<int>();
-        auto block_ptr = block_table_cpu.data_ptr<int>();
-        const int block_table_stride = block_table.stride(0);
-        for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx)
-        {
-            const int start = cache_ptr[batch_idx];
-            for (int token_idx = 0; token_idx < seqlen_new; ++token_idx)
-            {
-                const int logical_pos = start + token_idx;
-                const int table_idx = logical_pos / page_block_size;
-                const int page_offset = logical_pos - table_idx * page_block_size;
-                const int physical_block = block_ptr[batch_idx * block_table_stride + table_idx];
-                k_cache[physical_block][page_offset].copy_(k[batch_idx][token_idx]);
-                v_cache[physical_block][page_offset].copy_(v[batch_idx][token_idx]);
-            }
-        }
+        run_kvcache_paged_append(k_cache, v_cache, k, v, cache_seqlens, block_table);
     }
 
     const bool use_native_kvcache = has_block_table || num_splits > 1;
