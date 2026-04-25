@@ -427,8 +427,9 @@ __global__ void kvcache_split_kernel(
         lse_accum[int64_t(split_idx) * batch_size * nheads * seqlen_q + row_idx] = row_lse;
     }
 
-    for (int dim = 0; dim < Headdim; ++dim) {
-        float local_out = 0.0f;
+    for (int d = 0; d < Headdim; d += 2) {
+        float local_out0 = 0.0f;
+        float local_out1 = 0.0f;
         int v_table_idx = 0;
         int v_page_offset = 0;
         int v_physical_block = -1;
@@ -450,24 +451,31 @@ __global__ void kvcache_split_kernel(
                 v_base = int64_t(v_physical_block) * v_batch_stride + int64_t(v_page_offset) * v_row_stride
                     + int64_t(kv_head) * v_head_stride;
             }
-            local_out += p * __half2float(v_cache[v_base + dim]);
+            const half2 v2 = *reinterpret_cast<const half2 *>(v_cache + v_base + d);
+            const float2 vf = __half22float2(v2);
+            local_out0 += p * vf.x;
+            local_out1 += p * vf.y;
             if (block_table != nullptr) {
                 paged_advance_in_split(
                     v_table_idx, v_page_offset, v_physical_block, pos, split_end, blockDim.x, batch, block_table,
                     block_table_batch_stride, page_block_size, pbs_is_pow2, pbs_lg);
             }
         }
-        const float dim_out = block_sum<kThreads>(local_out);
+        const float out0 = block_sum<kThreads>(local_out0);
+        const float out1 = block_sum<kThreads>(local_out1);
         if (threadIdx.x == 0) {
             if (num_splits == 1) {
                 out[int64_t(batch) * o_batch_stride + int64_t(q_pos) * o_row_stride
-                    + int64_t(head) * o_head_stride + dim] = __float2half_rn(dim_out);
-                if (dim == 0) {
+                    + int64_t(head) * o_head_stride + d] = __float2half_rn(out0);
+                out[int64_t(batch) * o_batch_stride + int64_t(q_pos) * o_row_stride
+                    + int64_t(head) * o_head_stride + d + 1] = __float2half_rn(out1);
+                if (d == 0) {
                     lse[int64_t(batch) * nheads * seqlen_q + int64_t(head) * seqlen_q + q_pos] =
                         row_lse == -INFINITY ? 0.0f : row_lse;
                 }
             } else {
-                out_accum[(int64_t(split_idx) * batch_size * nheads * seqlen_q + row_idx) * Headdim + dim] = dim_out;
+                out_accum[(int64_t(split_idx) * batch_size * nheads * seqlen_q + row_idx) * Headdim + d] = out0;
+                out_accum[(int64_t(split_idx) * batch_size * nheads * seqlen_q + row_idx) * Headdim + d + 1] = out1;
             }
         }
     }
@@ -527,7 +535,8 @@ __global__ void kvcache_decode_split_kernel(
         }
         if (threadIdx.x < Headdim) {
             if (num_splits == 1) {
-                out[int64_t(batch) * o_batch_stride + int64_t(head) * o_head_stride + threadIdx.x] = __float2half_rn(0.0f);
+                out[int64_t(batch) * o_batch_stride + int64_t(0) * o_row_stride
+                    + int64_t(head) * o_head_stride + threadIdx.x] = __float2half_rn(0.0f);
             } else {
                 out_accum[(int64_t(split_idx) * batch_size * nheads + row_idx) * Headdim + threadIdx.x] = 0.0f;
             }
@@ -535,113 +544,131 @@ __global__ void kvcache_decode_split_kernel(
         return;
     }
 
-    const int dim = threadIdx.x;
-    float q_val = 0.0f;
-    if (dim < Headdim) {
-        q_val = __half2float(q[int64_t(batch) * q_batch_stride
-            + int64_t(0) * q_row_stride + int64_t(head) * q_head_stride + dim]);
+    __shared__ float q_vec[Headdim];
+    if (threadIdx.x < Headdim) {
+        q_vec[threadIdx.x] = __half2float(q[int64_t(batch) * q_batch_stride
+            + int64_t(0) * q_row_stride + int64_t(head) * q_head_stride + threadIdx.x]);
     }
+    __syncthreads();
 
-    int table_idx_k = paged_table_idx(split_start, page_block_size, pbs_is_pow2, pbs_lg);
-    int page_offset_k = paged_page_offset(split_start, page_block_size, pbs_is_pow2, pbs_lg);
+    // K phase: parallel over positions; one q_dot per key (no per-key full-CTA sum).
+    float local_max = -FLT_MAX;
+    int table_idx_k = 0;
+    int page_offset_k = 0;
     int physical_block_k = -1;
-    if (block_table != nullptr && split_len > 0) {
-        physical_block_k = block_table[int64_t(batch) * block_table_batch_stride + table_idx_k];
+    if (block_table != nullptr) {
+        const int start_pos = split_start + threadIdx.x;
+        table_idx_k = paged_table_idx(start_pos, page_block_size, pbs_is_pow2, pbs_lg);
+        page_offset_k = paged_page_offset(start_pos, page_block_size, pbs_is_pow2, pbs_lg);
+        if (start_pos < split_end) {
+            physical_block_k = block_table[int64_t(batch) * block_table_batch_stride + table_idx_k];
+        }
     }
-    for (int pos_idx = 0; pos_idx < split_len; ++pos_idx) {
-        float dot = 0.0f;
-        if (dim < Headdim) {
-            int64_t k_base = 0;
-            if (block_table == nullptr) {
-                const int pos = split_start + pos_idx;
-                k_base = int64_t(cache_batch) * k_batch_stride + int64_t(pos) * k_row_stride
-                    + int64_t(kv_head) * k_head_stride;
-            } else {
-                k_base = int64_t(physical_block_k) * k_batch_stride + int64_t(page_offset_k) * k_row_stride
-                    + int64_t(kv_head) * k_head_stride;
-            }
-            dot = q_val * __half2float(k_cache[k_base + dim]);
+    for (int pos = split_start + threadIdx.x; pos < split_end; pos += kDecodeThreads) {
+        int64_t k_base = 0;
+        if (block_table == nullptr) {
+            k_base = int64_t(cache_batch) * k_batch_stride + int64_t(pos) * k_row_stride
+                + int64_t(kv_head) * k_head_stride;
+        } else {
+            k_base = int64_t(physical_block_k) * k_batch_stride + int64_t(page_offset_k) * k_row_stride
+                + int64_t(kv_head) * k_head_stride;
         }
-        const float score = block_sum<kDecodeThreads>(dot);
-        if (threadIdx.x == 0) {
-            scores[pos_idx] = score * softmax_scale;
-        }
-        __syncthreads();
+        const float dot = q_dot_k_half2<Headdim>(q_vec, k_cache + k_base);
+        const float sc = dot * softmax_scale;
+        scores[pos - split_start] = sc;
+        local_max = fmaxf(local_max, sc);
         if (block_table != nullptr) {
-            const int pos = split_start + pos_idx;
             paged_advance_in_split(
-                table_idx_k, page_offset_k, physical_block_k, pos, split_end, 1, batch, block_table,
+                table_idx_k, page_offset_k, physical_block_k, pos, split_end, kDecodeThreads, batch, block_table,
                 block_table_batch_stride, page_block_size, pbs_is_pow2, pbs_lg);
         }
     }
+    const float row_max = block_max<kDecodeThreads>(local_max);
 
-    float row_max = -INFINITY;
-    if (threadIdx.x == 0) {
-        for (int i = 0; i < split_len; ++i) {
-            row_max = fmaxf(row_max, scores[i]);
-        }
+    float local_sum = 0.0f;
+    for (int pos = split_start + threadIdx.x; pos < split_end; pos += kDecodeThreads) {
+        const int idx = pos - split_start;
+        const float s = scores[idx];
+        const float p = expf(s - row_max);
+        scores[idx] = p;
+        local_sum += p;
     }
-    __shared__ float s_row_max;
-    if (threadIdx.x == 0) {
-        s_row_max = row_max;
-    }
-    __syncthreads();
-    row_max = s_row_max;
+    const float row_sum = block_sum<kDecodeThreads>(local_sum);
+    const float row_lse = row_sum == 0.0f ? -INFINITY : row_max + logf(row_sum);
+    const float inv_row_sum = row_sum == 0.0f ? 0.0f : 1.0f / row_sum;
 
-    __shared__ float s_row_lse;
-    if (threadIdx.x == 0) {
-        float row_sum = 0.0f;
-        for (int i = 0; i < split_len; ++i) {
-            scores[i] = expf(scores[i] - row_max);
-            row_sum += scores[i];
-        }
-        s_row_lse = row_sum == 0.0f ? -INFINITY : row_max + logf(row_sum);
-        if (num_splits > 1) {
-            lse_accum[int64_t(split_idx) * batch_size * nheads + row_idx] = s_row_lse;
-        }
+    if (threadIdx.x == 0 && num_splits > 1) {
+        lse_accum[int64_t(split_idx) * batch_size * nheads + row_idx] = row_lse;
     }
-    __syncthreads();
-
-    if (dim < Headdim) {
-        float out_val = 0.0f;
-        int table_idx_v = paged_table_idx(split_start, page_block_size, pbs_is_pow2, pbs_lg);
-        int page_offset_v = paged_page_offset(split_start, page_block_size, pbs_is_pow2, pbs_lg);
-        int physical_block_v = -1;
-        if (block_table != nullptr && split_len > 0) {
-            physical_block_v = block_table[int64_t(batch) * block_table_batch_stride + table_idx_v];
+    if (num_splits == 1 && row_lse == -INFINITY) {
+        if (threadIdx.x < Headdim) {
+            out[int64_t(batch) * o_batch_stride + int64_t(0) * o_row_stride
+                + int64_t(head) * o_head_stride + threadIdx.x] = __float2half_rn(0.0f);
         }
-        for (int pos_idx = 0; pos_idx < split_len; ++pos_idx) {
+        if (threadIdx.x == 0) {
+            lse[int64_t(batch) * nheads + head] = 0.0f;
+        }
+        return;
+    }
+    if (num_splits > 1 && row_lse == -INFINITY) {
+        if (threadIdx.x < Headdim) {
+            out_accum[(int64_t(split_idx) * batch_size * nheads + row_idx) * Headdim + threadIdx.x] = 0.0f;
+        }
+        return;
+    }
+
+    // V: half2 per position for pairs of dims; two block_sums per pair.
+    for (int d = 0; d < Headdim; d += 2) {
+        float local_out0 = 0.0f;
+        float local_out1 = 0.0f;
+        int v_table_idx = 0;
+        int v_page_offset = 0;
+        int v_physical_block = -1;
+        if (block_table != nullptr) {
+            const int start_pos = split_start + threadIdx.x;
+            v_table_idx = paged_table_idx(start_pos, page_block_size, pbs_is_pow2, pbs_lg);
+            v_page_offset = paged_page_offset(start_pos, page_block_size, pbs_is_pow2, pbs_lg);
+            if (start_pos < split_end) {
+                v_physical_block = block_table[int64_t(batch) * block_table_batch_stride + v_table_idx];
+            }
+        }
+        for (int pos = split_start + threadIdx.x; pos < split_end; pos += kDecodeThreads) {
+            const int idx = pos - split_start;
+            const float p = scores[idx] * inv_row_sum;
             int64_t v_base = 0;
             if (block_table == nullptr) {
-                const int pos = split_start + pos_idx;
                 v_base = int64_t(cache_batch) * v_batch_stride + int64_t(pos) * v_row_stride
                     + int64_t(kv_head) * v_head_stride;
             } else {
-                v_base = int64_t(physical_block_v) * v_batch_stride + int64_t(page_offset_v) * v_row_stride
+                v_base = int64_t(v_physical_block) * v_batch_stride + int64_t(v_page_offset) * v_row_stride
                     + int64_t(kv_head) * v_head_stride;
             }
-            out_val += scores[pos_idx] * __half2float(v_cache[v_base + dim]);
+            const half2 v2 = *reinterpret_cast<const half2 *>(v_cache + v_base + d);
+            const float2 vf = __half22float2(v2);
+            local_out0 += p * vf.x;
+            local_out1 += p * vf.y;
             if (block_table != nullptr) {
-                const int pos = split_start + pos_idx;
                 paged_advance_in_split(
-                    table_idx_v, page_offset_v, physical_block_v, pos, split_end, 1, batch, block_table,
+                    v_table_idx, v_page_offset, v_physical_block, pos, split_end, kDecodeThreads, batch, block_table,
                     block_table_batch_stride, page_block_size, pbs_is_pow2, pbs_lg);
             }
         }
-        if (s_row_lse != -INFINITY) {
-            out_val *= expf(row_max - s_row_lse);
-        } else {
-            out_val = 0.0f;
+        const float acc0 = block_sum<kDecodeThreads>(local_out0);
+        const float acc1 = block_sum<kDecodeThreads>(local_out1);
+        if (threadIdx.x == 0) {
+            if (num_splits == 1) {
+                out[int64_t(batch) * o_batch_stride + int64_t(0) * o_row_stride
+                    + int64_t(head) * o_head_stride + d] = __float2half_rn(acc0);
+                out[int64_t(batch) * o_batch_stride + int64_t(0) * o_row_stride
+                    + int64_t(head) * o_head_stride + d + 1] = __float2half_rn(acc1);
+                if (d == 0) {
+                    lse[int64_t(batch) * nheads + head] = row_lse;
+                }
+            } else {
+                out_accum[(int64_t(split_idx) * batch_size * nheads + row_idx) * Headdim + d] = acc0;
+                out_accum[(int64_t(split_idx) * batch_size * nheads + row_idx) * Headdim + d + 1] = acc1;
+            }
         }
-        if (num_splits == 1) {
-            out[int64_t(batch) * o_batch_stride + int64_t(0) * o_row_stride
-                + int64_t(head) * o_head_stride + dim] = __float2half_rn(out_val);
-        } else {
-            out_accum[(int64_t(split_idx) * batch_size * nheads + row_idx) * Headdim + dim] = out_val;
-        }
-    }
-    if (threadIdx.x == 0 && num_splits == 1) {
-        lse[int64_t(batch) * nheads + head] = s_row_lse == -INFINITY ? 0.0f : s_row_lse;
     }
 }
 
@@ -936,6 +963,21 @@ std::vector<at::Tensor> run_mha_fwd_kvcache_native(
     const int rows = batch_size * nheads * seqlen_q;
     int num_splits =
         choose_num_splits(requested_num_splits, seqlen_k_max, head_dim, seqlen_q, has_block_table);
+    // Score/decode split kernels: dynamic `scores[split_len]` + static `q_vec[Headdim]`; stay within 48 KiB
+    // per block. Bump split count (up to 128) so a single split never needs more than the limit, avoiding
+    // a multi-second legacy fallback when users request e.g. num_splits=1 on long paged context.
+    constexpr int kMaxSplitsClamp = 128;
+    constexpr size_t kKvcacheSmemPerBlock = 48 * 1024;
+    const auto kvcache_scorebuf_smem_bytes = [&](int ns) -> size_t {
+        if (ns <= 0) {
+            return 0u;
+        }
+        const int sl = (seqlen_k_max + ns - 1) / ns;
+        return size_t(sl) * sizeof(float) + size_t(head_dim) * sizeof(float);
+    };
+    while (num_splits < kMaxSplitsClamp && kvcache_scorebuf_smem_bytes(num_splits) > kKvcacheSmemPerBlock) {
+        num_splits += 1;
+    }
     const char *legacy_env = std::getenv("FLASH_TURING_LEGACY_COMBINE");
     const bool use_legacy_combine = legacy_env != nullptr && legacy_env[0] == '1';
 
@@ -955,18 +997,18 @@ std::vector<at::Tensor> run_mha_fwd_kvcache_native(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     const bool wants_decode_kernel = seqlen_q == 1 && is_causal;
     const int split_len_max = (seqlen_k_max + num_splits - 1) / num_splits;
-    const size_t decode_smem_bytes = size_t(split_len_max) * sizeof(float);
-    const size_t split_smem_bytes = size_t(split_len_max) * sizeof(float);
-    // Decode kernel stores one score per split token in dynamic shared memory.
+    const size_t score_dynamic_bytes = size_t(split_len_max) * sizeof(float);
     // Keep launches within the safe per-block limit to avoid cudaErrorInvalidValue.
     constexpr size_t kMaxDecodeSmemBytes = 48 * 1024;
     constexpr size_t kMaxSplitSmemBytes = 48 * 1024;
-    const bool can_use_decode_kernel = wants_decode_kernel && decode_smem_bytes <= kMaxDecodeSmemBytes;
-    const bool can_use_split_scores_kernel = split_smem_bytes <= kMaxSplitSmemBytes;
+    const bool can_use_decode_kernel = wants_decode_kernel
+        && (size_t(head_dim) * sizeof(float) + score_dynamic_bytes) <= kMaxDecodeSmemBytes;
+    const bool can_use_split_scores_kernel =
+        (size_t(head_dim) * sizeof(float) + score_dynamic_bytes) <= kMaxSplitSmemBytes;
     if (head_dim == 64) {
         if (can_use_decode_kernel) {
             dim3 decode_grid(batch_size * nheads, num_splits);
-            kvcache_decode_split_kernel<64><<<decode_grid, kDecodeThreads, decode_smem_bytes, stream>>>(
+            kvcache_decode_split_kernel<64><<<decode_grid, kDecodeThreads, score_dynamic_bytes, stream>>>(
                 reinterpret_cast<const half *>(q.data_ptr()),
                 reinterpret_cast<const half *>(k_cache.data_ptr()),
                 reinterpret_cast<const half *>(v_cache.data_ptr()),
@@ -984,7 +1026,7 @@ std::vector<at::Tensor> run_mha_fwd_kvcache_native(
                 out.stride(0), out.stride(1), out.stride(2),
                 block_table_batch_stride, softmax_scale);
         } else if (can_use_split_scores_kernel) {
-            kvcache_split_kernel<64><<<grid, kThreads, split_smem_bytes, stream>>>(
+            kvcache_split_kernel<64><<<grid, kThreads, score_dynamic_bytes, stream>>>(
                 reinterpret_cast<const half *>(q.data_ptr()),
                 reinterpret_cast<const half *>(k_cache.data_ptr()),
                 reinterpret_cast<const half *>(v_cache.data_ptr()),
@@ -1042,7 +1084,7 @@ std::vector<at::Tensor> run_mha_fwd_kvcache_native(
     } else {
         if (can_use_decode_kernel) {
             dim3 decode_grid(batch_size * nheads, num_splits);
-            kvcache_decode_split_kernel<128><<<decode_grid, kDecodeThreads, decode_smem_bytes, stream>>>(
+            kvcache_decode_split_kernel<128><<<decode_grid, kDecodeThreads, score_dynamic_bytes, stream>>>(
                 reinterpret_cast<const half *>(q.data_ptr()),
                 reinterpret_cast<const half *>(k_cache.data_ptr()),
                 reinterpret_cast<const half *>(v_cache.data_ptr()),
@@ -1060,7 +1102,7 @@ std::vector<at::Tensor> run_mha_fwd_kvcache_native(
                 out.stride(0), out.stride(1), out.stride(2),
                 block_table_batch_stride, softmax_scale);
         } else if (can_use_split_scores_kernel) {
-            kvcache_split_kernel<128><<<grid, kThreads, split_smem_bytes, stream>>>(
+            kvcache_split_kernel<128><<<grid, kThreads, score_dynamic_bytes, stream>>>(
                 reinterpret_cast<const half *>(q.data_ptr()),
                 reinterpret_cast<const half *>(k_cache.data_ptr()),
                 reinterpret_cast<const half *>(v_cache.data_ptr()),
