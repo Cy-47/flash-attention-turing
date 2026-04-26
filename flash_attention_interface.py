@@ -634,6 +634,11 @@ def _validate_unsupported_kvcache_args(
         raise NotImplementedError("Turing KV-cache does not support ALiBi yet")
 
 
+def _validate_supported_head_dim(head_dim: int) -> None:
+    if head_dim not in (64, 128):
+        raise ValueError("Turing FlashAttention supports head_dim 64 or 128")
+
+
 def _copy_kv_to_contiguous_cache(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -804,6 +809,7 @@ def flash_attn_with_kvcache(
     )
     if (k is None) != (v is None):
         raise ValueError("k and v must either both be provided or both be None")
+    _validate_supported_head_dim(q.shape[-1])
     if cache_seqlens is None:
         if k is not None:
             raise ValueError("cache_seqlens is required when appending k and v")

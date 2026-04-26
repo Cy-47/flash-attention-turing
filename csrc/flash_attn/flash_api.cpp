@@ -5,6 +5,16 @@
 
 namespace py = pybind11;
 
+namespace {
+
+inline void check_supported_head_dim(const int head_size)
+{
+    TORCH_CHECK(head_size == 64 || head_size == 128,
+                "Turing FlashAttention supports head_dim 64 or 128");
+}
+
+} // namespace
+
 std::vector<at::Tensor> run_mha_fwd_kvcache_native(
     at::Tensor q,
     at::Tensor k_cache,
@@ -204,6 +214,7 @@ mha_fwd(at::Tensor q,
     TORCH_CHECK(v.size(2) == num_heads_k, "k and v num_heads must match");
     TORCH_CHECK(k.size(3) == head_size && v.size(3) == head_size, "q/k/v head_dim must match");
     TORCH_CHECK(num_heads % num_heads_k == 0, "num_heads_q must be divisible by num_heads_k for GQA/MQA");
+    check_supported_head_dim(head_size);
 
     at::Tensor o = torch::zeros(q.sizes(), q.options().dtype(torch::kFloat16));
 
@@ -277,6 +288,7 @@ mha_bwd(at::Tensor q,
     TORCH_CHECK(k.size(3) == head_size && v.size(3) == head_size, "q/k/v head_dim must match");
     TORCH_CHECK(out.sizes() == q.sizes() && dout.sizes() == q.sizes(), "out and dout must match q shape");
     TORCH_CHECK(num_heads % num_heads_k == 0, "num_heads_q must be divisible by num_heads_k for GQA/MQA");
+    check_supported_head_dim(head_size);
 
     at::Tensor dq = torch::zeros(q.sizes(), q.options().dtype(torch::kFloat16));
     at::Tensor dk = torch::zeros(k.sizes(), k.options().dtype(torch::kFloat16));
@@ -370,6 +382,7 @@ mha_varlen_fwd(at::Tensor q,
     const int num_heads = q.size(1);
     const int num_heads_k = k.size(1);
     const int head_size = q.size(2);
+    check_supported_head_dim(head_size);
 
     at::Tensor out = torch::zeros_like(q);
     at::Tensor l = torch::zeros({batch_size, num_heads, max_seqlen_q}, q.options().dtype(torch::kFloat32));
@@ -442,6 +455,7 @@ mha_varlen_bwd(at::Tensor q,
     const int64_t num_heads_k = k.size(1);
     const int64_t head_size = q.size(2);
     const int64_t total_k = k.size(0);
+    check_supported_head_dim(head_size);
     TORCH_CHECK(l.size(0) == batch_size && l.size(1) == num_heads && l.size(2) == max_seqlen_q,
                 "l must have shape [batch_size, nheads_q, max_seqlen_q]");
 
@@ -535,6 +549,7 @@ mha_fwd_kvcache(at::Tensor q,
                 "q, k_cache, v_cache head_dim must match");
     TORCH_CHECK(q.size(2) % k_cache.size(2) == 0,
                 "num_heads_q must be divisible by num_heads_k for GQA/MQA");
+    check_supported_head_dim(q.size(3));
     TORCH_CHECK(q.stride(-1) == 1 && k_cache.stride(-1) == 1 && v_cache.stride(-1) == 1,
                 "q, k_cache, v_cache must have contiguous last dimension");
     TORCH_CHECK(cache_seqlens.is_cuda(), "cache_seqlens must be a CUDA tensor");

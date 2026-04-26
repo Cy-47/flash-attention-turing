@@ -959,6 +959,8 @@ std::vector<at::Tensor> run_mha_fwd_kvcache_native(
     const int nheads = q.size(2);
     const int head_dim = q.size(3);
     const int nheads_k = k_cache.size(2);
+    TORCH_CHECK(head_dim == 64 || head_dim == 128,
+                "Turing FlashAttention supports head_dim 64 or 128");
     const int seqlen_k_max = has_block_table ? block_table.size(1) * k_cache.size(1) : k_cache.size(1);
     const int rows = batch_size * nheads * seqlen_q;
     int num_splits =
