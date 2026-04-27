@@ -1,7 +1,9 @@
 import argparse
+import csv
 import statistics
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 import torch
@@ -281,6 +283,215 @@ def make_case_tensors(case: BenchmarkCase, dtype: torch.dtype, device: torch.dev
     return q, k_cache, v_cache, cache_seqlens, cache_batch_idx, k_new, v_new
 
 
+def tensor_nbytes(tensor: Optional[torch.Tensor]) -> int:
+    return 0 if tensor is None else tensor.numel() * tensor.element_size()
+
+
+def case_effective_lengths(case: BenchmarkCase) -> list[int]:
+    append_len = case.append_len if case.append_new_kv else 0
+    return [case.seqlen_cache // 2 + 13 * idx + append_len for idx in range(case.batch_size)]
+
+
+def logical_kv_storage_bytes(case: BenchmarkCase, dtype: torch.dtype) -> dict[str, float]:
+    dtype_bytes = torch.empty((), dtype=dtype).element_size()
+    bytes_per_token = 2 * case.nheads_k * case.head_dim * dtype_bytes
+    effective_lengths = case_effective_lengths(case)
+    live_bytes = sum(effective_lengths) * bytes_per_token
+    contiguous_alloc_bytes = case.batch_size_cache * case.seqlen_cache * bytes_per_token
+    if case.paged_block_size is None:
+        logical_alloc_bytes = contiguous_alloc_bytes
+    else:
+        logical_tokens = sum(
+            ((length + case.paged_block_size - 1) // case.paged_block_size)
+            * case.paged_block_size
+            for length in effective_lengths
+        )
+        logical_alloc_bytes = logical_tokens * bytes_per_token
+    util_pct = 100.0 * live_bytes / logical_alloc_bytes if logical_alloc_bytes else 0.0
+    return {
+        "live_kv_mib": live_bytes / (1024**2),
+        "allocated_kv_mib": logical_alloc_bytes / (1024**2),
+        "wasted_kv_mib": (logical_alloc_bytes - live_bytes) / (1024**2),
+        "kv_storage_util_pct": util_pct,
+    }
+
+
+def measure_case_vram(
+    case: BenchmarkCase,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> dict[str, float | int | str]:
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    free_before, total_bytes = torch.cuda.mem_get_info(device)
+
+    torch.manual_seed(0)
+    q = torch.randn(case.batch_size, case.seqlen_q, case.nheads_q, case.head_dim, device=device, dtype=dtype)
+    cache_seqlens = torch.tensor(
+        [case.seqlen_cache // 2 + 13 * idx for idx in range(case.batch_size)],
+        device=device,
+        dtype=torch.int32,
+    )
+    if case.append_new_kv:
+        k_new = torch.randn(case.batch_size, case.append_len, case.nheads_k, case.head_dim, device=device, dtype=dtype)
+        v_new = torch.randn(case.batch_size, case.append_len, case.nheads_k, case.head_dim, device=device, dtype=dtype)
+    else:
+        k_new = None
+        v_new = None
+    block_table = None
+    if case.paged_block_size is not None:
+        cache_batch_idx = None
+        max_num_blocks_per_seq = (case.seqlen_cache + case.paged_block_size - 1) // case.paged_block_size
+        num_blocks = case.batch_size * max_num_blocks_per_seq
+        k_runtime = torch.randn(
+            num_blocks,
+            case.paged_block_size,
+            case.nheads_k,
+            case.head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        v_runtime = torch.randn_like(k_runtime)
+        block_table = torch.arange(num_blocks, device=device, dtype=torch.int32).reshape(
+            case.batch_size, max_num_blocks_per_seq
+        )
+    else:
+        k_runtime = torch.randn(
+            case.batch_size_cache,
+            case.seqlen_cache,
+            case.nheads_k,
+            case.head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        v_runtime = torch.randn_like(k_runtime)
+        cache_batch_idx = (
+            torch.randperm(case.batch_size_cache, dtype=torch.int32, device=device)[: case.batch_size]
+            if case.has_batch_idx
+            else None
+        )
+
+    softmax_scale = q.shape[-1] ** (-0.5)
+    out = flash_attn_with_kvcache(
+        q,
+        k_runtime,
+        v_runtime,
+        k=k_new,
+        v=v_new,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=cache_batch_idx,
+        block_table=block_table,
+        num_splits=0,
+        softmax_scale=softmax_scale,
+        causal=case.causal,
+    )
+    torch.cuda.synchronize()
+    free_after, _ = torch.cuda.mem_get_info(device)
+    peak_allocated_bytes = torch.cuda.max_memory_allocated(device)
+    live_tensor_bytes = sum(
+        tensor_nbytes(tensor)
+        for tensor in (q, cache_seqlens, cache_batch_idx, k_new, v_new, k_runtime, v_runtime, block_table, out)
+    )
+    storage = logical_kv_storage_bytes(case, dtype)
+    footprint_mib = (free_before - free_after) / (1024**2)
+    row: dict[str, float | int | str] = {
+        "case": case.name,
+        "layout": "paged" if case.paged_block_size is not None else "contiguous",
+        "paged_block_size": case.paged_block_size or 0,
+        "batch_size": case.batch_size,
+        "seqlen_q": case.seqlen_q,
+        "seqlen_cache": case.seqlen_cache,
+        "head_dim": case.head_dim,
+        "peak_allocated_mib": peak_allocated_bytes / (1024**2),
+        "footprint_delta_mib": footprint_mib,
+        "device_memory_util_pct": 100.0 * peak_allocated_bytes / total_bytes,
+        "live_tensor_mib": live_tensor_bytes / (1024**2),
+    }
+    row.update(storage)
+
+    del q, cache_seqlens, cache_batch_idx, k_new, v_new, k_runtime, v_runtime, block_table, out
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    return row
+
+
+def write_vram_csv(rows: Sequence[dict[str, float | int | str]], csv_path: Path) -> None:
+    if not rows:
+        return
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(rows[0].keys())
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def run_vram_summary(
+    cases: Sequence[BenchmarkCase],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    csv_path: Optional[Path],
+) -> list[dict[str, float | int | str]]:
+    rows = []
+    print("=== vram_summary ===")
+    for case in cases:
+        row = measure_case_vram(case, dtype=dtype, device=device)
+        rows.append(row)
+        print(
+            f"{row['case']} layout={row['layout']} paged={row['paged_block_size']} "
+            f"peak_allocated={row['peak_allocated_mib']:.2f}MiB "
+            f"device_util={row['device_memory_util_pct']:.3f}% "
+            f"kv_live={row['live_kv_mib']:.2f}MiB "
+            f"kv_alloc={row['allocated_kv_mib']:.2f}MiB "
+            f"kv_util={row['kv_storage_util_pct']:.2f}%"
+        )
+    if csv_path is not None:
+        write_vram_csv(rows, csv_path)
+        print(f"wrote_vram_csv={csv_path}")
+    return rows
+
+
+def run_logical_vram_summary(
+    cases: Sequence[BenchmarkCase],
+    *,
+    dtype: torch.dtype,
+    csv_path: Optional[Path],
+) -> list[dict[str, float | int | str]]:
+    rows = []
+    print("=== vram_summary ===")
+    for case in cases:
+        storage = logical_kv_storage_bytes(case, dtype)
+        row: dict[str, float | int | str] = {
+            "case": case.name,
+            "layout": "paged" if case.paged_block_size is not None else "contiguous",
+            "paged_block_size": case.paged_block_size or 0,
+            "batch_size": case.batch_size,
+            "seqlen_q": case.seqlen_q,
+            "seqlen_cache": case.seqlen_cache,
+            "head_dim": case.head_dim,
+            "peak_allocated_mib": "",
+            "footprint_delta_mib": "",
+            "device_memory_util_pct": "",
+            "live_tensor_mib": "",
+        }
+        row.update(storage)
+        rows.append(row)
+        print(
+            f"{row['case']} layout={row['layout']} paged={row['paged_block_size']} "
+            "peak_allocated=n/a device_util=n/a "
+            f"kv_live={row['live_kv_mib']:.2f}MiB "
+            f"kv_alloc={row['allocated_kv_mib']:.2f}MiB "
+            f"kv_util={row['kv_storage_util_pct']:.2f}%"
+        )
+    if csv_path is not None:
+        write_vram_csv(rows, csv_path)
+        print(f"wrote_vram_csv={csv_path}")
+    return rows
+
+
 def run_case(
     case: BenchmarkCase,
     *,
@@ -506,6 +717,19 @@ def main() -> None:
     parser.add_argument("--paged-block-sizes", type=str, default="256")
     parser.add_argument("--extra-baselines", dest="extra_baselines", action="store_true", default=True)
     parser.add_argument("--no-extra-baselines", dest="extra_baselines", action="store_false")
+    parser.add_argument("--vram-summary", dest="vram_summary", action="store_true", default=True)
+    parser.add_argument("--no-vram-summary", dest="vram_summary", action="store_false")
+    parser.add_argument(
+        "--vram-only",
+        action="store_true",
+        help="Only collect the VRAM summary and skip latency benchmarking.",
+    )
+    parser.add_argument(
+        "--vram-csv",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "Presentation" / "Data" / "vram_summary.csv",
+        help="CSV path for VRAM summary rows. Use an empty string to disable writing.",
+    )
     parser.add_argument("--global-warmup-iters", type=int, default=80)
     parser.add_argument(
         "--quick",
@@ -523,12 +747,7 @@ def main() -> None:
         args.extra_baselines = False
         args.global_warmup_iters = min(args.global_warmup_iters, 5)
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required to run benchmark_kvcache.py")
-
-    device = torch.device("cuda")
     dtype = torch.float16
-    global_gpu_warmup(device, dtype, iters=args.global_warmup_iters)
     cases = [
         BenchmarkCase("read_decode_h64_causal", 2, 2, 1, 4096, 0, 6, 1, 64, True, False, False),
         BenchmarkCase("append_decode_h64_causal", 2, 2, 1, 4096, 1, 6, 1, 64, True, True, False),
@@ -580,10 +799,27 @@ def main() -> None:
                 )
         cases.extend(paged_cases)
 
+    vram_csv = args.vram_csv if str(args.vram_csv) else None
+    if not torch.cuda.is_available():
+        if args.vram_summary and args.vram_only:
+            print(
+                f"torch={torch.__version__} device=CUDA-unavailable "
+                "mode=logical-vram-only"
+            )
+            run_logical_vram_summary(cases, dtype=dtype, csv_path=vram_csv)
+            return
+        raise RuntimeError("CUDA is required to run latency benchmarks")
+
+    device = torch.device("cuda")
+    global_gpu_warmup(device, dtype, iters=args.global_warmup_iters)
     print(
         f"torch={torch.__version__} device={torch.cuda.get_device_name(0)} "
         f"warmup={args.warmup} repeats={args.repeats} global_warmup_iters={args.global_warmup_iters}"
     )
+    if args.vram_summary:
+        run_vram_summary(cases, dtype=dtype, device=device, csv_path=vram_csv)
+    if args.vram_only:
+        return
     if args.split_sweep:
         sweep_summaries = []
         split_values = list(range(0, max(args.split_max, 1) + 1))
