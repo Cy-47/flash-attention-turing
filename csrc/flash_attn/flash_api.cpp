@@ -657,7 +657,15 @@ mha_fwd_kvcache(at::Tensor q,
         run_kvcache_paged_append(k_cache, v_cache, k, v, cache_seqlens, block_table);
     }
 
-    const bool use_native_kvcache = has_block_table || num_splits > 1;
+    // Use the native KV-cache path when:
+    //   (a) paged layout (block_table present) — always native,
+    //   (b) caller requested explicit splits > 1,
+    //   (c) decode (seqlen_q == 1) — native runs choose_num_splits() and
+    //       dispatches the decode-specialised kernel; the upstream tiled FA
+    //       kernel is not efficient for single-token queries.
+    // For contiguous chunk (seqlen_q > 1, no explicit splits), the upstream
+    // tiled FlashAttention kernel is faster and remains the default.
+    const bool use_native_kvcache = has_block_table || num_splits > 1 || seqlen_q == 1;
     if (use_native_kvcache)
     {
         at::Tensor empty;

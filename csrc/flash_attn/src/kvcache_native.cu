@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdlib>
 #include <vector>
 
@@ -869,36 +870,85 @@ __global__ void paged_append_kernel(
     }
 }
 
+int ceil_div_int(const int a, const int b) {
+    return (a + b - 1) / b;
+}
+
+bool split_is_eligible(const int num_n_blocks, const int num_splits) {
+    return num_splits == 1
+        || ceil_div_int(num_n_blocks, num_splits) != ceil_div_int(num_n_blocks, num_splits - 1);
+}
+
+int num_splits_efficiency_heuristic(
+    const int row_blocks,
+    const int num_sms,
+    const int num_n_blocks,
+    const int max_splits) {
+    if (row_blocks >= int(0.8f * float(num_sms))) {
+        return 1;
+    }
+    const int capped_splits = std::min({max_splits, num_sms, num_n_blocks, 128});
+    float max_efficiency = 0.0f;
+    float efficiency[128] = {};
+    for (int split = 1; split <= capped_splits; ++split) {
+        if (!split_is_eligible(num_n_blocks, split)) {
+            continue;
+        }
+        const float waves = float(row_blocks * split) / float(num_sms);
+        const float eff = waves / std::ceil(waves);
+        efficiency[split - 1] = eff;
+        max_efficiency = std::max(max_efficiency, eff);
+    }
+    for (int split = 1; split <= capped_splits; ++split) {
+        if (!split_is_eligible(num_n_blocks, split)) {
+            continue;
+        }
+        if (efficiency[split - 1] >= 0.95f * max_efficiency) {
+            return split;
+        }
+    }
+    return 1;
+}
+
 int choose_num_splits(
     const int requested,
     const int seqlen_k,
     const int head_dim,
     const int seqlen_q,
+    const int batch_size,
+    const int nheads,
+    const int num_sms,
     const bool is_paged) {
     if (requested > 0) {
         return requested;
     }
+    (void)is_paged;
     const int block_n = head_dim <= 64 ? 256 : 128;
     const int n_blocks = (seqlen_k + block_n - 1) / block_n;
-    const int seqlen_k_bucket = seqlen_k >= 16384 ? 2 : (seqlen_k >= 8192 ? 1 : 0);
-    const int head_dim_bucket = head_dim <= 64 ? 0 : 1;
     if (n_blocks <= 1) {
         return 1;
     }
+
     if (seqlen_q > 1) {
-        // Chunked queries have enough intrinsic parallelism from seqlen_q.
         return 1;
     }
-    if (is_paged) {
-        // Paged decode remains split-sensitive on SM75; prefer a higher default split.
-        return std::min(8, n_blocks);
+
+    // Below roughly 2k tokens for h64 (or 1k for h128), split-KV overhead
+    // dominates on SM75 even when occupancy looks low.
+    if (n_blocks < 8) {
+        return 1;
     }
-    static constexpr int contiguous_decode_policy[3][2] = {
-        {1, 1},
-        {1, 1},
-        {2, 2},
-    };
-    return std::min(contiguous_decode_policy[seqlen_k_bucket][head_dim_bucket], n_blocks);
+
+    // Match upstream's split-KV intuition: split only when the output-row
+    // parallelism cannot fill the SMs well.  The split kernels use 64-row M
+    // blocks for inference, so query chunks contribute row blocks naturally.
+    const int num_m_blocks = ceil_div_int(seqlen_q, 64);
+    const int row_blocks = batch_size * nheads * num_m_blocks;
+    const int occupancy_splits = num_splits_efficiency_heuristic(row_blocks, num_sms, n_blocks, 128);
+    if (row_blocks <= num_sms / 3) {
+        return std::max(occupancy_splits, std::min(6, n_blocks));
+    }
+    return occupancy_splits;
 }
 
 }  // namespace
@@ -963,8 +1013,11 @@ std::vector<at::Tensor> run_mha_fwd_kvcache_native(
                 "Turing FlashAttention supports head_dim 64 or 128");
     const int seqlen_k_max = has_block_table ? block_table.size(1) * k_cache.size(1) : k_cache.size(1);
     const int rows = batch_size * nheads * seqlen_q;
+    const cudaDeviceProp *prop = at::cuda::getCurrentDeviceProperties();
     int num_splits =
-        choose_num_splits(requested_num_splits, seqlen_k_max, head_dim, seqlen_q, has_block_table);
+        choose_num_splits(
+            requested_num_splits, seqlen_k_max, head_dim, seqlen_q,
+            batch_size, nheads, prop->multiProcessorCount, has_block_table);
     // Score/decode split kernels: dynamic `scores[split_len]` + static `q_vec[Headdim]`; stay within 48 KiB
     // per block. Bump split count (up to 128) so a single split never needs more than the limit, avoiding
     // a multi-second legacy fallback when users request e.g. num_splits=1 on long paged context.
